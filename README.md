@@ -33,7 +33,7 @@ The relay **cannot read your traffic** -- all communication is end-to-end encryp
 ### Docker Compose (recommended)
 
 ```bash
-git clone https://github.com/agentanycast/agentanycast-relay.git
+git clone https://github.com/AgentAnycast/agentanycast-relay.git
 cd agentanycast-relay
 docker-compose up -d
 ```
