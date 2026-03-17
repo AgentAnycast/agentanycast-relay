@@ -1,0 +1,22 @@
+# Binaries
+agentanycast-relay
+relay
+*.exe
+
+# OS
+.DS_Store
+*.swp
+*.swo
+*~
+
+# IDE
+.idea/
+.vscode/
+
+# Test
+coverage.out
+*.test
+
+# Runtime
+*.key
+*.pem

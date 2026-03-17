@@ -1,0 +1,17 @@
+services:
+  relay:
+    build: .
+    ports:
+      - "4001:4001/tcp"
+      - "4001:4001/udp"
+    volumes:
+      - relay-data:/data
+    command:
+      - "--listen=/ip4/0.0.0.0/tcp/4001"
+      - "--key=/data/key"
+      - "--max-reservations=128"
+      - "--log-level=info"
+    restart: unless-stopped
+
+volumes:
+  relay-data:
