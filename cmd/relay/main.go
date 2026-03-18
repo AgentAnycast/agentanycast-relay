@@ -4,6 +4,7 @@
 // - Circuit Relay v2: resource-limited relay for peers that cannot directly connect
 // - AutoNAT service: helps peers detect their NAT type
 // - Bootstrap node: initial peer discovery for new nodes
+// - Skill Registry: capability-based agent discovery (v0.2)
 package main
 
 import (
@@ -11,6 +12,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
 	"strings"
@@ -19,12 +21,18 @@ import (
 
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/event"
+	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/p2p/muxer/yamux"
 	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	"github.com/libp2p/go-libp2p/p2p/security/noise"
-	"github.com/libp2p/go-libp2p/p2p/muxer/yamux"
 	libp2pquic "github.com/libp2p/go-libp2p/p2p/transport/quic"
 	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
 	"github.com/multiformats/go-multiaddr"
+	"google.golang.org/grpc"
+
+	pb "github.com/agentanycast/agentanycast-proto/gen/go/agentanycast/v1"
+	"github.com/agentanycast/agentanycast-relay/internal/registry"
 )
 
 var version = "dev"
@@ -35,6 +43,8 @@ func main() {
 		flagKeyPath         = flag.String("key", "", "path to persistent identity key")
 		flagMaxReservations = flag.Int("max-reservations", 128, "max concurrent relay reservations")
 		flagLogLevel        = flag.String("log-level", "info", "log level (debug/info/warn/error)")
+		flagRegistryListen  = flag.String("registry-listen", ":50052", "gRPC listen address for Skill Registry")
+		flagRegistryTTL     = flag.Duration("registry-ttl", 30*time.Second, "skill registration TTL")
 		flagVersion         = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Parse()
@@ -72,7 +82,6 @@ func main() {
 	}
 
 	// Also listen on QUIC using the same IP and port as TCP.
-	// Replace /tcp/<port> with /udp/<port>/quic-v1 in the listen address.
 	quicAddrStr := strings.Replace(*flagListenAddr, "/tcp/", "/udp/", 1) + "/quic-v1"
 	quicMA, err := multiaddr.NewMultiaddr(quicAddrStr)
 	if err != nil {
@@ -118,23 +127,72 @@ func main() {
 		os.Exit(1)
 	}
 
+	// ── Skill Registry ──────────────────────────────────────
+	reg := registry.New(registry.Config{
+		TTL:    *flagRegistryTTL,
+		Logger: logger,
+	})
+	defer reg.Close()
+
+	// Watch for peer disconnections and remove their registrations.
+	sub, err := h.EventBus().Subscribe(new(event.EvtPeerConnectednessChanged))
+	if err != nil {
+		logger.Error("failed to subscribe to peer events", "error", err)
+		os.Exit(1)
+	}
+	go func() {
+		defer sub.Close()
+		for evt := range sub.Out() {
+			e, ok := evt.(event.EvtPeerConnectednessChanged)
+			if !ok {
+				continue
+			}
+			if e.Connectedness == network.NotConnected {
+				reg.RemovePeer(e.Peer.String())
+				logger.Debug("peer disconnected, removed from registry", "peer_id", e.Peer)
+			}
+		}
+	}()
+
+	// ── gRPC Server for Registry ────────────────────────────
+	grpcLis, err := net.Listen("tcp", *flagRegistryListen)
+	if err != nil {
+		logger.Error("failed to listen for gRPC", "addr", *flagRegistryListen, "error", err)
+		os.Exit(1)
+	}
+
+	grpcServer := grpc.NewServer()
+	pb.RegisterRegistryServiceServer(grpcServer, registry.NewGRPCServer(reg, logger))
+
+	go func() {
+		logger.Info("registry gRPC server started", "addr", *flagRegistryListen)
+		if err := grpcServer.Serve(grpcLis); err != nil {
+			logger.Error("registry gRPC server error", "error", err)
+		}
+	}()
+
 	// ── Print Startup Info ───────────────────────────────────
 	logger.Info("agentanycast-relay started",
 		"version", version,
 		"peer_id", h.ID().String(),
 		"addresses", h.Addrs(),
 		"max_reservations", *flagMaxReservations,
+		"registry_listen", *flagRegistryListen,
+		"registry_ttl", flagRegistryTTL.String(),
 	)
 
 	for _, addr := range h.Addrs() {
 		fmt.Printf("RELAY_ADDR=%s/p2p/%s\n", addr, h.ID())
 	}
+	fmt.Printf("REGISTRY_ADDR=%s\n", *flagRegistryListen)
 
 	// ── Wait for Shutdown ────────────────────────────────────
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	<-ctx.Done()
+
 	logger.Info("shutting down")
+	grpcServer.GracefulStop()
 }
 
 func loadOrGenerateKey(path string) (crypto.PrivKey, error) {
