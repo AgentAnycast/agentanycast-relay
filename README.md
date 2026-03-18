@@ -1,15 +1,18 @@
 # AgentAnycast Relay
 
-Self-hosted circuit relay server for cross-network agent communication.
+Self-hosted circuit relay server and skill registry for cross-network agent communication.
 
-[![Go](https://img.shields.io/badge/Go-1.21+-00ADD8?logo=go&logoColor=white)](https://go.dev)
+[![Go](https://img.shields.io/badge/Go-1.24+-00ADD8?logo=go&logoColor=white)](https://go.dev)
 [![License](https://img.shields.io/badge/License-FSL--1.1--ALv2-blue)](LICENSE)
 
 > **Deploy your own relay in one command.** AgentAnycast is fully decentralized -- you own your infrastructure.
 
 ## What is this?
 
-When two agents are on different networks (behind NATs or firewalls), they can't connect directly. A relay server bridges them:
+The relay server provides two services:
+
+1. **Circuit Relay** — bridges agents across different networks when direct connections aren't possible
+2. **Skill Registry** — lets agents register their skills and discover each other by capability
 
 ```
 Agent A (behind NAT)                              Agent B (behind NAT)
@@ -68,10 +71,54 @@ export AGENTANYCAST_BOOTSTRAP_PEERS="/ip4/<YOUR_IP>/tcp/4001/p2p/12D3KooW..."
 | `--listen` | Multiaddr to listen on | `/ip4/0.0.0.0/tcp/4001` |
 | `--key` | Path to persistent identity key | (generates in-memory) |
 | `--max-reservations` | Max concurrent relay reservations | `128` |
+| `--registry-listen` | gRPC address for skill registry | `:50052` |
+| `--registry-ttl` | Skill registration TTL | `30s` |
 | `--log-level` | Log level (`debug`, `info`, `warn`, `error`) | `info` |
 | `--version` | Print version and exit | |
 
-## Resource Limits
+## Skill Registry
+
+The relay includes a **skill registry** that enables capability-based agent discovery. Agents register their skills with the relay, and other agents can query by skill ID to find providers.
+
+### How It Works
+
+1. Agent starts and connects to the relay
+2. Agent registers its skills (e.g., `"translate"`, `"summarize"`)
+3. Other agents query `discover("translate")` to find providers
+4. Registry returns matching agents with their Peer IDs and metadata
+5. Agents send heartbeats to keep registrations alive (TTL-based)
+
+### Registry gRPC API
+
+| RPC | Description |
+|---|---|
+| `RegisterSkills` | Register skills with the relay. Returns expiration timestamp. |
+| `UnregisterSkills` | Remove specific skill registrations. |
+| `DiscoverBySkill` | Find agents offering a specific skill. Supports tag-based filtering. |
+| `Heartbeat` | Renew TTL on existing registrations. |
+
+### Registry Limits
+
+| Limit | Value |
+|---|---|
+| Max registrations | 4096 |
+| Default discover limit | 100 |
+| Hard discover limit | 1000 |
+| Default TTL | 30 seconds |
+
+### Tag-Based Filtering
+
+Skills can include tags for fine-grained matching:
+
+```python
+# Agent registers with tags
+Skill(id="translate", description="...", tags={"lang": "en,fr,de"})
+
+# Another agent discovers with tag filter
+agents = await node.discover("translate", tags={"lang": "fr"})
+```
+
+## Relay Resource Limits
 
 The relay enforces per-peer and global limits to prevent abuse:
 
