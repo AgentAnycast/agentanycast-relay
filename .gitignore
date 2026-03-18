@@ -1,6 +1,7 @@
 # Binaries (root only, so cmd/relay/ source dir is not ignored)
 /agentanycast-relay
 /relay
+/bin/
 *.exe
 
 # OS
