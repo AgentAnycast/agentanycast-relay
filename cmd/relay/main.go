@@ -150,11 +150,17 @@ func loadOrGenerateKey(path string) (crypto.PrivKey, error) {
 			if err != nil {
 				return nil, err
 			}
-			raw, _ := crypto.MarshalPrivateKey(priv)
-			if mkErr := os.MkdirAll(path[:len(path)-len("/key")], 0700); mkErr != nil {
-				// best effort
+			raw, err := crypto.MarshalPrivateKey(priv)
+			if err != nil {
+				return nil, fmt.Errorf("marshal private key: %w", err)
 			}
-			_ = os.WriteFile(path, raw, 0600)
+			dir := path[:len(path)-len("/key")]
+			if mkErr := os.MkdirAll(dir, 0700); mkErr != nil {
+				slog.Warn("failed to create key directory", "dir", dir, "error", mkErr)
+			}
+			if wErr := os.WriteFile(path, raw, 0600); wErr != nil {
+				slog.Warn("failed to persist identity key", "path", path, "error", wErr)
+			}
 			return priv, nil
 		}
 		return nil, err
