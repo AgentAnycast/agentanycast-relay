@@ -26,7 +26,7 @@ func TestRegisterAndDiscover(t *testing.T) {
 		t.Fatalf("Register: %v", err)
 	}
 
-	results := reg.DiscoverBySkill("summarize", nil, 0)
+	results := reg.DiscoverBySkill("summarize", nil, 0, false)
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(results))
 	}
@@ -38,7 +38,7 @@ func TestRegisterAndDiscover(t *testing.T) {
 	}
 
 	// Discover a non-existent skill.
-	results = reg.DiscoverBySkill("nonexistent", nil, 0)
+	results = reg.DiscoverBySkill("nonexistent", nil, 0, false)
 	if len(results) != 0 {
 		t.Fatalf("expected 0 results, got %d", len(results))
 	}
@@ -56,7 +56,7 @@ func TestTagFiltering(t *testing.T) {
 	}, "Agent ZH", "")
 
 	// Filter for lang=zh.
-	results := reg.DiscoverBySkill("translate", map[string]string{"lang": "zh"}, 0)
+	results := reg.DiscoverBySkill("translate", map[string]string{"lang": "zh"}, 0, false)
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(results))
 	}
@@ -65,7 +65,7 @@ func TestTagFiltering(t *testing.T) {
 	}
 
 	// No filter returns both.
-	results = reg.DiscoverBySkill("translate", nil, 0)
+	results = reg.DiscoverBySkill("translate", nil, 0, false)
 	if len(results) != 2 {
 		t.Fatalf("expected 2 results, got %d", len(results))
 	}
@@ -106,14 +106,14 @@ func TestTTLExpiration(t *testing.T) {
 	_, _ = reg.Register("peer-1", []SkillInfo{{SkillID: "echo"}}, "A", "")
 
 	// Immediately discoverable.
-	if len(reg.DiscoverBySkill("echo", nil, 0)) != 1 {
+	if len(reg.DiscoverBySkill("echo", nil, 0, false)) != 1 {
 		t.Fatal("expected 1 result before expiry")
 	}
 
 	// Wait for expiry + cleanup.
 	time.Sleep(100 * time.Millisecond)
 
-	if len(reg.DiscoverBySkill("echo", nil, 0)) != 0 {
+	if len(reg.DiscoverBySkill("echo", nil, 0, false)) != 0 {
 		t.Fatal("expected 0 results after expiry")
 	}
 }
@@ -133,7 +133,7 @@ func TestHeartbeatRenewal(t *testing.T) {
 
 	// Should still be discoverable after original TTL would have expired.
 	time.Sleep(30 * time.Millisecond)
-	if len(reg.DiscoverBySkill("echo", nil, 0)) != 1 {
+	if len(reg.DiscoverBySkill("echo", nil, 0, false)) != 1 {
 		t.Fatal("expected 1 result after heartbeat renewal")
 	}
 
@@ -150,7 +150,7 @@ func TestRemovePeer(t *testing.T) {
 	_, _ = reg.Register("peer-1", []SkillInfo{{SkillID: "echo"}}, "A", "")
 	reg.RemovePeer("peer-1")
 
-	if len(reg.DiscoverBySkill("echo", nil, 0)) != 0 {
+	if len(reg.DiscoverBySkill("echo", nil, 0, false)) != 0 {
 		t.Fatal("expected 0 results after RemovePeer")
 	}
 }
@@ -166,10 +166,10 @@ func TestUnregisterSpecificSkills(t *testing.T) {
 
 	reg.Unregister("peer-1", []string{"summarize"})
 
-	if len(reg.DiscoverBySkill("summarize", nil, 0)) != 0 {
+	if len(reg.DiscoverBySkill("summarize", nil, 0, false)) != 0 {
 		t.Fatal("expected 0 results for removed skill")
 	}
-	if len(reg.DiscoverBySkill("translate", nil, 0)) != 1 {
+	if len(reg.DiscoverBySkill("translate", nil, 0, false)) != 1 {
 		t.Fatal("expected 1 result for remaining skill")
 	}
 }
@@ -187,13 +187,13 @@ func TestDiscoverLimit(t *testing.T) {
 	}
 
 	// Explicit limit.
-	results := reg.DiscoverBySkill("echo", nil, 3)
+	results := reg.DiscoverBySkill("echo", nil, 3, false)
 	if len(results) != 3 {
 		t.Fatalf("expected 3 results with limit=3, got %d", len(results))
 	}
 
 	// Default limit (0 → DefaultDiscoverLimit=100).
-	results = reg.DiscoverBySkill("echo", nil, 0)
+	results = reg.DiscoverBySkill("echo", nil, 0, false)
 	if len(results) != 10 {
 		t.Fatalf("expected 10 results with default limit, got %d", len(results))
 	}
@@ -213,7 +213,7 @@ func TestConcurrentAccess(t *testing.T) {
 		}()
 		go func() {
 			defer wg.Done()
-			_ = reg.DiscoverBySkill("echo", nil, 0)
+			_ = reg.DiscoverBySkill("echo", nil, 0, false)
 		}()
 		go func() {
 			defer wg.Done()

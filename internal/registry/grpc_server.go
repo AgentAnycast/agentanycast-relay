@@ -81,7 +81,7 @@ func (s *GRPCServer) DiscoverBySkill(_ context.Context, req *pb.DiscoverBySkillR
 		return nil, status.Error(codes.InvalidArgument, "skill_id is required")
 	}
 
-	results := s.registry.DiscoverBySkill(req.SkillId, req.Tags, int(req.Limit))
+	results := s.registry.DiscoverBySkill(req.SkillId, req.Tags, int(req.Limit), req.Federated)
 
 	agents := make([]*pb.SkillRegistration, 0, len(results))
 	for _, r := range results {

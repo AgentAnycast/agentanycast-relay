@@ -21,7 +21,7 @@ func (s *Server) handleDiscoverAgents(ctx context.Context, req mcp.CallToolReque
 		limit = 100
 	}
 
-	regs := s.registry.DiscoverBySkill(skillID, nil, limit)
+	regs := s.registry.DiscoverBySkill(skillID, nil, limit, true)
 
 	type agentResult struct {
 		PeerID      string   `json:"peer_id"`

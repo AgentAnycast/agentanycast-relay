@@ -15,8 +15,11 @@ import (
 // DefaultTTL is the default registration time-to-live.
 const DefaultTTL = 30 * time.Second
 
-// DefaultMaxRegistrations is the maximum number of concurrent registrations.
+// DefaultMaxRegistrations is the maximum number of concurrent local registrations.
 const DefaultMaxRegistrations = 4096
+
+// DefaultMaxFederatedRegistrations is the maximum number of concurrent federated registrations.
+const DefaultMaxFederatedRegistrations = 8192
 
 // DefaultDiscoverLimit is the default max results for a discovery query.
 const DefaultDiscoverLimit = 100
@@ -42,23 +45,27 @@ type Registration struct {
 	AgentDescription string
 	RegisteredAt     time.Time
 	ExpiresAt        time.Time
+	Origin           string // empty = local registration, relay_id = federated from another relay
+	Version          uint64 // Lamport clock for last-writer-wins conflict resolution
 }
 
 // Config holds registry configuration.
 type Config struct {
-	TTL              time.Duration
-	MaxRegistrations int
-	CleanupInterval  time.Duration
-	Logger           *slog.Logger
+	TTL                      time.Duration
+	MaxRegistrations         int
+	MaxFederatedRegistrations int
+	CleanupInterval          time.Duration
+	Logger                   *slog.Logger
 }
 
 // Registry is a thread-safe, in-memory skill registry.
 type Registry struct {
-	mu      sync.RWMutex
-	entries map[string]*Registration // keyed by peer_id
-	config  Config
-	logger  *slog.Logger
-	stopCh  chan struct{}
+	mu        sync.RWMutex
+	entries   map[string]*Registration // keyed by peer_id (local registrations)
+	federated map[string]*Registration // keyed by peer_id (federated registrations)
+	config    Config
+	logger    *slog.Logger
+	stopCh    chan struct{}
 }
 
 // New creates a new Registry with the given configuration.
@@ -69,6 +76,9 @@ func New(cfg Config) *Registry {
 	if cfg.MaxRegistrations == 0 {
 		cfg.MaxRegistrations = DefaultMaxRegistrations
 	}
+	if cfg.MaxFederatedRegistrations == 0 {
+		cfg.MaxFederatedRegistrations = DefaultMaxFederatedRegistrations
+	}
 	if cfg.CleanupInterval == 0 {
 		cfg.CleanupInterval = cfg.TTL / 2
 	}
@@ -77,10 +87,11 @@ func New(cfg Config) *Registry {
 	}
 
 	r := &Registry{
-		entries: make(map[string]*Registration),
-		config:  cfg,
-		logger:  cfg.Logger,
-		stopCh:  make(chan struct{}),
+		entries:   make(map[string]*Registration),
+		federated: make(map[string]*Registration),
+		config:    cfg,
+		logger:    cfg.Logger,
+		stopCh:    make(chan struct{}),
 	}
 
 	go r.cleanupLoop()
@@ -170,7 +181,8 @@ func (r *Registry) Unregister(peerID string, skillIDs []string) {
 
 // DiscoverBySkill returns all non-expired registrations that offer the given skill.
 // Optional tag filters are matched using AND semantics.
-func (r *Registry) DiscoverBySkill(skillID string, tags map[string]string, limit int) []Registration {
+// When includeFederated is true, results also include federated entries from peer relays.
+func (r *Registry) DiscoverBySkill(skillID string, tags map[string]string, limit int, includeFederated bool) []Registration {
 	if limit <= 0 {
 		limit = DefaultDiscoverLimit
 	} else if limit > MaxDiscoverLimit {
@@ -183,6 +195,7 @@ func (r *Registry) DiscoverBySkill(skillID string, tags map[string]string, limit
 	now := time.Now()
 	var results []Registration
 
+	// Always search local entries first.
 	for _, reg := range r.entries {
 		if now.After(reg.ExpiresAt) {
 			continue
@@ -190,7 +203,22 @@ func (r *Registry) DiscoverBySkill(skillID string, tags map[string]string, limit
 		if hasSkill(reg, skillID, tags) {
 			results = append(results, *reg)
 			if len(results) >= limit {
-				break
+				return results
+			}
+		}
+	}
+
+	// Optionally include federated entries.
+	if includeFederated {
+		for _, reg := range r.federated {
+			if now.After(reg.ExpiresAt) {
+				continue
+			}
+			if hasSkill(reg, skillID, tags) {
+				results = append(results, *reg)
+				if len(results) >= limit {
+					break
+				}
 			}
 		}
 	}
@@ -284,9 +312,106 @@ func (r *Registry) evictExpired() {
 			evicted++
 		}
 	}
-	if evicted > 0 {
-		r.logger.Debug("evicted expired registrations", "count", evicted, "remaining", len(r.entries))
+	fedEvicted := 0
+	for peerID, reg := range r.federated {
+		if now.After(reg.ExpiresAt) {
+			delete(r.federated, peerID)
+			fedEvicted++
+		}
 	}
+	if evicted > 0 || fedEvicted > 0 {
+		r.logger.Debug("evicted expired registrations",
+			"local", evicted,
+			"federated", fedEvicted,
+			"remaining_local", len(r.entries),
+			"remaining_federated", len(r.federated),
+		)
+	}
+}
+
+// ErrFederatedRegistryFull is returned when the federated registry has reached its maximum capacity.
+var ErrFederatedRegistryFull = errors.New("federated registry has reached maximum capacity")
+
+// RegisterFederated stores a federated registration from another relay.
+// Uses LWW (last-writer-wins): only accepts if version >= existing version.
+func (r *Registry) RegisterFederated(peerID, originRelayID string, skills []SkillInfo, agentName, agentDesc string, registeredAt, expiresAt time.Time, version uint64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// Check LWW: reject if existing version is newer.
+	if existing, ok := r.federated[peerID]; ok {
+		if existing.Version > version {
+			return nil // silently ignore stale update
+		}
+	} else {
+		// New entry — enforce capacity limit.
+		if len(r.federated) >= r.config.MaxFederatedRegistrations {
+			return ErrFederatedRegistryFull
+		}
+	}
+
+	// Deep-copy tags.
+	copiedSkills := make([]SkillInfo, len(skills))
+	for i, s := range skills {
+		var tags map[string]string
+		if len(s.Tags) > 0 {
+			tags = make(map[string]string, len(s.Tags))
+			for k, v := range s.Tags {
+				tags[k] = v
+			}
+		}
+		copiedSkills[i] = SkillInfo{
+			SkillID:     s.SkillID,
+			Description: s.Description,
+			Tags:        tags,
+		}
+	}
+
+	r.federated[peerID] = &Registration{
+		PeerID:           peerID,
+		Skills:           copiedSkills,
+		AgentName:        agentName,
+		AgentDescription: agentDesc,
+		RegisteredAt:     registeredAt,
+		ExpiresAt:        expiresAt,
+		Origin:           originRelayID,
+		Version:          version,
+	}
+
+	return nil
+}
+
+// LocalRegistrations returns local (non-federated) registrations updated since the given time.
+func (r *Registry) LocalRegistrations(since time.Time) []Registration {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	now := time.Now()
+	var results []Registration
+	for _, reg := range r.entries {
+		if now.After(reg.ExpiresAt) {
+			continue
+		}
+		if reg.RegisteredAt.After(since) || reg.RegisteredAt.Equal(since) {
+			results = append(results, *reg)
+		}
+	}
+	return results
+}
+
+// FederatedRegistrations returns all non-expired federated registrations.
+func (r *Registry) FederatedRegistrations() []Registration {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	now := time.Now()
+	var results []Registration
+	for _, reg := range r.federated {
+		if now.Before(reg.ExpiresAt) {
+			results = append(results, *reg)
+		}
+	}
+	return results
 }
 
 func hasSkill(reg *Registration, skillID string, tags map[string]string) bool {

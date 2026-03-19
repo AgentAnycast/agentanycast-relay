@@ -28,10 +28,12 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/security/noise"
 	libp2pquic "github.com/libp2p/go-libp2p/p2p/transport/quic"
 	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
+	libp2pwebtransport "github.com/libp2p/go-libp2p/p2p/transport/webtransport"
 	"github.com/multiformats/go-multiaddr"
 	"google.golang.org/grpc"
 
 	pb "github.com/agentanycast/agentanycast-proto/gen/go/agentanycast/v1"
+	"github.com/agentanycast/agentanycast-relay/internal/federation"
 	relaymcp "github.com/agentanycast/agentanycast-relay/internal/mcp"
 	"github.com/agentanycast/agentanycast-relay/internal/registry"
 )
@@ -46,8 +48,11 @@ func main() {
 		flagLogLevel        = flag.String("log-level", "info", "log level (debug/info/warn/error)")
 		flagRegistryListen  = flag.String("registry-listen", ":50052", "gRPC listen address for Skill Registry")
 		flagRegistryTTL     = flag.Duration("registry-ttl", 30*time.Second, "skill registration TTL")
-		flagMCPListen       = flag.String("mcp-listen", ":8080", "MCP Streamable HTTP listen address (empty to disable)")
-		flagVersion         = flag.Bool("version", false, "print version and exit")
+		flagEnableWebTransport = flag.Bool("enable-webtransport", false, "enable WebTransport (QUIC-based, browser-compatible)")
+		flagMCPListen              = flag.String("mcp-listen", ":8080", "MCP Streamable HTTP listen address (empty to disable)")
+		flagFederationPeers        = flag.String("federation-peers", "", "comma-separated peer relay gRPC addresses for federation")
+		flagFederationSyncInterval = flag.Duration("federation-sync-interval", 10*time.Second, "federation sync interval")
+		flagVersion                = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Parse()
 
@@ -93,8 +98,20 @@ func main() {
 
 	listenAddrs := []multiaddr.Multiaddr{listenMA, quicMA}
 
+	// Optionally add WebTransport listener.
+	if *flagEnableWebTransport {
+		wtAddrStr := strings.Replace(*flagListenAddr, "/tcp/", "/udp/", 1) + "/quic-v1/webtransport"
+		wtMA, wtErr := multiaddr.NewMultiaddr(wtAddrStr)
+		if wtErr != nil {
+			logger.Error("invalid WebTransport listen address", "addr", wtAddrStr, "error", wtErr)
+			os.Exit(1)
+		}
+		listenAddrs = append(listenAddrs, wtMA)
+		logger.Info("WebTransport enabled", "addr", wtAddrStr)
+	}
+
 	// ── libp2p Host with Relay v2 ────────────────────────────
-	h, err := libp2p.New(
+	opts := []libp2p.Option{
 		libp2p.Identity(privKey),
 		libp2p.ListenAddrs(listenAddrs...),
 		libp2p.Security(noise.ID, noise.New),
@@ -103,7 +120,13 @@ func main() {
 		libp2p.Transport(libp2pquic.NewTransport),
 		libp2p.EnableAutoNATv2(),
 		libp2p.ForceReachabilityPublic(), // Relay server must be public
-	)
+	}
+
+	if *flagEnableWebTransport {
+		opts = append(opts, libp2p.Transport(libp2pwebtransport.New))
+	}
+
+	h, err := libp2p.New(opts...)
 	if err != nil {
 		logger.Error("failed to create host", "error", err)
 		os.Exit(1)
@@ -166,6 +189,42 @@ func main() {
 	grpcServer := grpc.NewServer()
 	pb.RegisterRegistryServiceServer(grpcServer, registry.NewGRPCServer(reg, logger))
 
+	// ── Federation ──────────────────────────────────────────
+	var fed *federation.Federation
+	var federationPeers []string
+	if *flagFederationPeers != "" {
+		for _, p := range strings.Split(*flagFederationPeers, ",") {
+			p = strings.TrimSpace(p)
+			if p != "" {
+				federationPeers = append(federationPeers, p)
+			}
+		}
+	}
+
+	if len(federationPeers) > 0 {
+		relayID := h.ID().String()
+		fed = federation.New(federation.Config{
+			PeerRelays:   federationPeers,
+			SyncInterval: *flagFederationSyncInterval,
+			RelayID:      relayID,
+			Logger:       logger,
+		}, reg)
+
+		// Register FederationService on the same gRPC server.
+		pb.RegisterFederationServiceServer(grpcServer, federation.NewServer(reg, relayID, logger))
+
+		federationCtx, federationCancel := context.WithCancel(context.Background())
+		defer federationCancel()
+		if err := fed.Start(federationCtx); err != nil {
+			logger.Error("failed to start federation", "error", err)
+		} else {
+			logger.Info("federation enabled",
+				"peers", len(federationPeers),
+				"sync_interval", flagFederationSyncInterval.String(),
+			)
+		}
+	}
+
 	go func() {
 		logger.Info("registry gRPC server started", "addr", *flagRegistryListen)
 		if err := grpcServer.Serve(grpcLis); err != nil {
@@ -218,6 +277,9 @@ func main() {
 	<-ctx.Done()
 
 	logger.Info("shutting down")
+	if fed != nil {
+		fed.Stop()
+	}
 	if mcpSrv != nil {
 		mcpSrv.Close()
 	}
