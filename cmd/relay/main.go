@@ -32,6 +32,7 @@ import (
 	"google.golang.org/grpc"
 
 	pb "github.com/agentanycast/agentanycast-proto/gen/go/agentanycast/v1"
+	relaymcp "github.com/agentanycast/agentanycast-relay/internal/mcp"
 	"github.com/agentanycast/agentanycast-relay/internal/registry"
 )
 
@@ -45,6 +46,7 @@ func main() {
 		flagLogLevel        = flag.String("log-level", "info", "log level (debug/info/warn/error)")
 		flagRegistryListen  = flag.String("registry-listen", ":50052", "gRPC listen address for Skill Registry")
 		flagRegistryTTL     = flag.Duration("registry-ttl", 30*time.Second, "skill registration TTL")
+		flagMCPListen       = flag.String("mcp-listen", ":8080", "MCP Streamable HTTP listen address (empty to disable)")
 		flagVersion         = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Parse()
@@ -171,6 +173,26 @@ func main() {
 		}
 	}()
 
+	// ── MCP Server (Streamable HTTP) ────────────────────────
+	var mcpSrv *relaymcp.Server
+	if *flagMCPListen != "" {
+		var mcpErr error
+		mcpSrv, mcpErr = relaymcp.New(relaymcp.Config{
+			ListenAddr: *flagMCPListen,
+			Registry:   reg,
+			Host:       h,
+			Logger:     logger,
+		})
+		if mcpErr != nil {
+			logger.Error("failed to create MCP server", "error", mcpErr)
+			os.Exit(1)
+		}
+		if err := mcpSrv.Start(); err != nil {
+			logger.Error("failed to start MCP server", "error", err)
+			os.Exit(1)
+		}
+	}
+
 	// ── Print Startup Info ───────────────────────────────────
 	logger.Info("agentanycast-relay started",
 		"version", version,
@@ -179,12 +201,16 @@ func main() {
 		"max_reservations", *flagMaxReservations,
 		"registry_listen", *flagRegistryListen,
 		"registry_ttl", flagRegistryTTL.String(),
+		"mcp_listen", *flagMCPListen,
 	)
 
 	for _, addr := range h.Addrs() {
 		fmt.Printf("RELAY_ADDR=%s/p2p/%s\n", addr, h.ID())
 	}
 	fmt.Printf("REGISTRY_ADDR=%s\n", *flagRegistryListen)
+	if *flagMCPListen != "" {
+		fmt.Printf("MCP_ADDR=%s\n", *flagMCPListen)
+	}
 
 	// ── Wait for Shutdown ────────────────────────────────────
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -192,6 +218,9 @@ func main() {
 	<-ctx.Done()
 
 	logger.Info("shutting down")
+	if mcpSrv != nil {
+		mcpSrv.Close()
+	}
 	grpcServer.GracefulStop()
 }
 

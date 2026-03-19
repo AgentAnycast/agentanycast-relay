@@ -21,3 +21,4 @@ coverage.out
 # Runtime
 *.key
 *.pem
+.mcpregistry_*

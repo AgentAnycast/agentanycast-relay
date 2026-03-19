@@ -238,6 +238,21 @@ func (r *Registry) Count() int {
 	return count
 }
 
+// AllRegistrations returns all non-expired registrations.
+func (r *Registry) AllRegistrations() []Registration {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	now := time.Now()
+	var results []Registration
+	for _, reg := range r.entries {
+		if now.Before(reg.ExpiresAt) {
+			results = append(results, *reg)
+		}
+	}
+	return results
+}
+
 // Close stops the cleanup goroutine.
 func (r *Registry) Close() {
 	close(r.stopCh)

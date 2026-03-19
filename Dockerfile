@@ -18,6 +18,7 @@ COPY --from=builder /relay /usr/local/bin/agentanycast-relay
 
 EXPOSE 4001/tcp
 EXPOSE 4001/udp
+EXPOSE 8080/tcp
 
 ENTRYPOINT ["/usr/local/bin/agentanycast-relay"]
-CMD ["--listen", "/ip4/0.0.0.0/tcp/4001"]
+CMD ["--listen", "/ip4/0.0.0.0/tcp/4001", "--mcp-listen", ":8080"]

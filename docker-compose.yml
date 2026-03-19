@@ -4,12 +4,14 @@ services:
     ports:
       - "4001:4001/tcp"
       - "4001:4001/udp"
+      - "8080:8080/tcp"
     volumes:
       - relay-data:/data
     command:
       - "--listen=/ip4/0.0.0.0/tcp/4001"
       - "--key=/data/key"
       - "--max-reservations=128"
+      - "--mcp-listen=:8080"
       - "--log-level=info"
     restart: unless-stopped
 
