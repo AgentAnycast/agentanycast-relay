@@ -37,15 +37,17 @@ type Config struct {
 
 // Federation manages relay-to-relay skill registry synchronization.
 type Federation struct {
-	cfg      Config
-	registry *registry.Registry
-	clients  map[string]pb.FederationServiceClient
-	conns    map[string]*grpc.ClientConn
-	lastSync map[string]time.Time // per-peer sync timestamps
-	mu       sync.RWMutex
-	cancel   context.CancelFunc
-	wg       sync.WaitGroup
-	logger   *slog.Logger
+	cfg       Config
+	registry  *registry.Registry
+	clients   map[string]pb.FederationServiceClient
+	conns     map[string]*grpc.ClientConn
+	lastSync  map[string]time.Time // per-peer sync timestamps
+	mu        sync.RWMutex
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
+	logger    *slog.Logger
+	startOnce sync.Once
+	started   bool
 }
 
 // New creates a new Federation manager.
@@ -68,41 +70,55 @@ func New(cfg Config, reg *registry.Registry) *Federation {
 }
 
 // Start initializes connections to peer relays and begins the sync loop.
+// It is safe to call multiple times; only the first call has any effect.
 func (f *Federation) Start(ctx context.Context) error {
-	ctx, f.cancel = context.WithCancel(ctx)
+	var startErr error
+	f.startOnce.Do(func() {
+		ctx, f.cancel = context.WithCancel(ctx)
 
-	// Establish gRPC connections to all peer relays.
-	for _, addr := range f.cfg.PeerRelays {
-		conn, err := grpc.NewClient(addr,
-			grpc.WithTransportCredentials(insecure.NewCredentials()),
-		)
-		if err != nil {
-			f.logger.Warn("failed to connect to peer relay",
-				"addr", addr,
-				"error", err,
+		// Build connection maps before starting any goroutines to avoid races.
+		clients := make(map[string]pb.FederationServiceClient)
+		conns := make(map[string]*grpc.ClientConn)
+
+		for _, addr := range f.cfg.PeerRelays {
+			conn, err := grpc.NewClient(addr,
+				grpc.WithTransportCredentials(insecure.NewCredentials()),
 			)
-			continue
+			if err != nil {
+				f.logger.Warn("failed to connect to peer relay",
+					"addr", addr,
+					"error", err,
+				)
+				continue
+			}
+			conns[addr] = conn
+			clients[addr] = pb.NewFederationServiceClient(conn)
+			f.logger.Info("connected to peer relay", "addr", addr)
 		}
-		f.conns[addr] = conn
-		f.clients[addr] = pb.NewFederationServiceClient(conn)
-		f.logger.Info("connected to peer relay", "addr", addr)
-	}
 
-	if len(f.clients) == 0 {
-		f.logger.Info("no peer relays configured, federation disabled")
-		return nil
-	}
+		// Assign maps under write lock before starting goroutines.
+		f.mu.Lock()
+		f.clients = clients
+		f.conns = conns
+		f.started = true
+		f.mu.Unlock()
 
-	f.wg.Add(1)
-	go f.syncLoop(ctx)
+		if len(clients) == 0 {
+			f.logger.Info("no peer relays configured, federation disabled")
+			return
+		}
 
-	f.logger.Info("federation started",
-		"relay_id", f.cfg.RelayID,
-		"peers", len(f.clients),
-		"sync_interval", f.cfg.SyncInterval,
-	)
+		f.wg.Add(1)
+		go f.syncLoop(ctx)
 
-	return nil
+		f.logger.Info("federation started",
+			"relay_id", f.cfg.RelayID,
+			"peers", len(clients),
+			"sync_interval", f.cfg.SyncInterval,
+		)
+	})
+
+	return startErr
 }
 
 // Stop gracefully shuts down the federation sync loop and closes connections.
@@ -127,5 +143,7 @@ func (f *Federation) Stop() error {
 
 // PeerCount returns the number of connected peer relays.
 func (f *Federation) PeerCount() int {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	return len(f.clients)
 }

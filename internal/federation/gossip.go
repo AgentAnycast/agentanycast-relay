@@ -2,6 +2,7 @@ package federation
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	pb "github.com/agentanycast/agentanycast-proto/gen/go/agentanycast/v1"
@@ -60,6 +61,14 @@ func (f *Federation) syncPeer(ctx context.Context, addr string, client pb.Federa
 
 	accepted := 0
 	for _, fedReg := range resp.Registrations {
+		// Guard against nil timestamps to prevent panic on .AsTime().
+		if fedReg.RegisteredAt == nil || fedReg.ExpiresAt == nil {
+			f.logger.Debug("skipping federated registration with nil timestamp",
+				"peer_id", fedReg.PeerId,
+			)
+			continue
+		}
+
 		skills := pbSkillsToRegistry(fedReg.Skills)
 		originRelay := fedReg.OriginRelayId
 		if originRelay == "" {
@@ -128,28 +137,39 @@ func (f *Federation) PushLocal(regs []registry.Registration) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	var firstErr error
+	var (
+		mu       sync.Mutex
+		firstErr error
+		wg       sync.WaitGroup
+	)
 	for addr, client := range f.clients {
-		resp, err := client.PushRegistrations(ctx, &pb.PushRegistrationsRequest{
-			RelayId:       f.cfg.RelayID,
-			Registrations: fedRegs,
-		})
-		if err != nil {
-			f.logger.Warn("federation push failed",
-				"peer_addr", addr,
-				"error", err,
-			)
-			if firstErr == nil {
-				firstErr = err
+		wg.Add(1)
+		go func(addr string, client pb.FederationServiceClient) {
+			defer wg.Done()
+			resp, err := client.PushRegistrations(ctx, &pb.PushRegistrationsRequest{
+				RelayId:       f.cfg.RelayID,
+				Registrations: fedRegs,
+			})
+			if err != nil {
+				f.logger.Warn("federation push failed",
+					"peer_addr", addr,
+					"error", err,
+				)
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				mu.Unlock()
+				return
 			}
-			continue
-		}
-		f.logger.Debug("federation push completed",
-			"peer_addr", addr,
-			"accepted", resp.Accepted,
-			"rejected", resp.Rejected,
-		)
+			f.logger.Debug("federation push completed",
+				"peer_addr", addr,
+				"accepted", resp.Accepted,
+				"rejected", resp.Rejected,
+			)
+		}(addr, client)
 	}
+	wg.Wait()
 
 	return firstErr
 }

@@ -66,6 +66,7 @@ type Registry struct {
 	config    Config
 	logger    *slog.Logger
 	stopCh    chan struct{}
+	closeOnce sync.Once
 }
 
 // New creates a new Registry with the given configuration.
@@ -138,6 +139,7 @@ func (r *Registry) Register(peerID string, skills []SkillInfo, agentName, agentD
 		AgentDescription: agentDesc,
 		RegisteredAt:     now,
 		ExpiresAt:        expiresAt,
+		Version:          uint64(now.UnixNano()),
 	}
 
 	return expiresAt, nil
@@ -196,23 +198,28 @@ func (r *Registry) DiscoverBySkill(skillID string, tags map[string]string, limit
 	var results []Registration
 
 	// Always search local entries first.
+	localPeers := make(map[string]struct{})
 	for _, reg := range r.entries {
 		if now.After(reg.ExpiresAt) {
 			continue
 		}
 		if hasSkill(reg, skillID, tags) {
 			results = append(results, *reg)
+			localPeers[reg.PeerID] = struct{}{}
 			if len(results) >= limit {
 				return results
 			}
 		}
 	}
 
-	// Optionally include federated entries.
+	// Optionally include federated entries, skipping peers already found locally.
 	if includeFederated {
 		for _, reg := range r.federated {
 			if now.After(reg.ExpiresAt) {
 				continue
+			}
+			if _, isLocal := localPeers[reg.PeerID]; isLocal {
+				continue // local registration takes priority
 			}
 			if hasSkill(reg, skillID, tags) {
 				results = append(results, *reg)
@@ -281,9 +288,11 @@ func (r *Registry) AllRegistrations() []Registration {
 	return results
 }
 
-// Close stops the cleanup goroutine.
+// Close stops the cleanup goroutine. It is safe to call multiple times.
 func (r *Registry) Close() {
-	close(r.stopCh)
+	r.closeOnce.Do(func() {
+		close(r.stopCh)
+	})
 }
 
 func (r *Registry) cleanupLoop() {
@@ -339,9 +348,14 @@ func (r *Registry) RegisterFederated(peerID, originRelayID string, skills []Skil
 	defer r.mu.Unlock()
 
 	// Check LWW: reject if existing version is newer.
+	// On equal versions, use lexicographic comparison of origin relay ID as tiebreaker
+	// (lower relay ID wins).
 	if existing, ok := r.federated[peerID]; ok {
 		if existing.Version > version {
 			return nil // silently ignore stale update
+		}
+		if existing.Version == version && existing.Origin <= originRelayID {
+			return nil // tiebreaker: existing origin wins (lower or equal relay ID)
 		}
 	} else {
 		// New entry — enforce capacity limit.
