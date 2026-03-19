@@ -1,0 +1,68 @@
+# AgentAnycast Relay
+
+Go relay server for the AgentAnycast P2P network. Provides Circuit Relay v2, AutoNAT signaling, and a skill registry for anycast discovery.
+
+## Architecture
+
+- Standalone Go binary, Docker-deployable
+- Three core services: Circuit Relay v2, AutoNAT signaling, skill registry (gRPC)
+- libp2p host with persistent Ed25519 identity
+- Skill registry implements `registry_service.proto` from agentanycast-proto
+
+## Directory Structure
+
+```
+cmd/
+  relay/                 # Entry point
+internal/
+  relay/                 # Circuit Relay v2 wrapper with resource limits
+  signaling/             # AutoNAT signaling service
+  registry/              # Skill registry: register, unregister, discover, heartbeat
+tests/                   # Integration tests
+Dockerfile               # Production image
+Dockerfile.integration   # Integration test image
+docker-compose.yml       # Run with persistent key volume
+```
+
+## Common Patterns
+
+### Skill registry RPCs
+
+```go
+// RegisterSkills — agent declares its skills
+func (r *Registry) RegisterSkills(ctx context.Context, req *pb.RegisterSkillsRequest) (*pb.RegisterSkillsResponse, error)
+
+// DiscoverBySkill — client finds agents by skill
+func (r *Registry) DiscoverBySkill(ctx context.Context, req *pb.DiscoverBySkillRequest) (*pb.DiscoverBySkillResponse, error)
+
+// Heartbeat — agent maintains registration
+func (r *Registry) Heartbeat(ctx context.Context, req *pb.HeartbeatRequest) (*pb.HeartbeatResponse, error)
+```
+
+### Resource limit configuration
+
+```go
+relay.New(host,
+    relay.WithResources(relay.Resources{
+        MaxReservations: 128,
+        MaxCircuits:     16,
+        BufferSize:      4096,
+    }),
+)
+```
+
+## Code Style
+
+- Go 1.25+
+- Structured logging (Zap)
+- Error wrapping: `fmt.Errorf("operation: %w", err)`
+- Context propagation: always pass `context.Context` as first parameter
+
+## Build & Test
+
+```bash
+go build -o agentanycast-relay ./cmd/relay
+go test ./...
+docker build -t agentanycast/relay .
+docker compose up
+```

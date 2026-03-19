@@ -1,0 +1,51 @@
+# AgentAnycast Relay
+
+> Relay server for AgentAnycast — provides Circuit Relay v2, AutoNAT signaling, and a skill registry for anycast discovery. Docker-deployable.
+
+## Documentation
+
+- [Architecture](https://github.com/AgentAnycast/agentanycast/blob/main/docs/architecture.md): NAT traversal and relay design
+- [Deployment](https://github.com/AgentAnycast/agentanycast/blob/main/docs/deployment.md): Relay setup, Docker, resource limits
+
+## Build & Run
+
+```bash
+# Build binary
+go build -o agentanycast-relay ./cmd/relay
+
+# Run tests
+go test ./...
+
+# Docker
+docker build -t agentanycast/relay .
+docker compose up                    # Run with persistent key storage
+```
+
+## Key Components
+
+### Circuit Relay v2
+Relays traffic between peers that cannot establish direct connections. Wraps libp2p Circuit Relay v2 with configurable resource limits (max reservations, bandwidth, duration).
+
+### AutoNAT Signaling
+Helps peers detect their external address and NAT type. Enables DCUtR hole punching when possible.
+
+### Skill Registry
+gRPC service for anycast discovery. Agents register their skills; peers query to find agents by capability.
+
+- `RegisterSkills` — agent registers available skills with the relay
+- `UnregisterSkills` — agent removes skills on shutdown
+- `DiscoverBySkill` — client queries for peers offering a specific skill
+- `Heartbeat` — agents send periodic heartbeats to maintain registration
+
+## Key Concepts
+
+- **Stateless relay**: Relay does not inspect or store message content
+- **Resource limits**: Configurable max connections, bandwidth caps, reservation timeouts
+- **Persistent identity**: Ed25519 key stored on disk for stable PeerID across restarts
+- **Docker-ready**: Dockerfile and docker-compose.yml included with volume for key persistence
+
+## Related Repositories
+
+- [agentanycast](https://github.com/AgentAnycast/agentanycast): Documentation hub
+- [agentanycast-node](https://github.com/AgentAnycast/agentanycast-node): Go daemon (connects to relay)
+- [agentanycast-proto](https://github.com/AgentAnycast/agentanycast-proto): Protobuf definitions (registry_service.proto)
