@@ -1,6 +1,6 @@
 # AgentAnycast Relay
 
-Self-hosted circuit relay server and skill registry for cross-network agent communication.
+Self-hosted circuit relay server, skill registry, and federation hub for cross-network agent communication.
 
 [![Go](https://img.shields.io/badge/Go-1.24+-00ADD8?logo=go&logoColor=white)](https://go.dev)
 [![License](https://img.shields.io/badge/License-FSL--1.1--ALv2-blue)](LICENSE)
@@ -9,10 +9,11 @@ Self-hosted circuit relay server and skill registry for cross-network agent comm
 
 ## What is this?
 
-The relay server provides two services:
+The relay server provides three services:
 
 1. **Circuit Relay** — bridges agents across different networks when direct connections aren't possible
 2. **Skill Registry** — lets agents register their skills and discover each other by capability
+3. **Federation** — synchronizes registrations across multiple relays for global discovery
 
 ```
 Agent A (behind NAT)                              Agent B (behind NAT)
@@ -60,7 +61,6 @@ docker-compose logs relay
 Give this address to your agents:
 
 ```bash
-# On each agent node:
 export AGENTANYCAST_BOOTSTRAP_PEERS="/ip4/<YOUR_IP>/tcp/4001/p2p/12D3KooW..."
 ```
 
@@ -73,12 +73,16 @@ export AGENTANYCAST_BOOTSTRAP_PEERS="/ip4/<YOUR_IP>/tcp/4001/p2p/12D3KooW..."
 | `--max-reservations` | Max concurrent relay reservations | `128` |
 | `--registry-listen` | gRPC address for skill registry | `:50052` |
 | `--registry-ttl` | Skill registration TTL | `30s` |
+| `--enable-webtransport` | Enable WebTransport (QUIC-based) | `false` |
+| `--mcp-listen` | MCP Streamable HTTP listen address | `:8080` |
+| `--federation-peers` | Comma-separated peer relay gRPC addresses | (none) |
+| `--federation-sync-interval` | Federation gossip sync interval | `10s` |
 | `--log-level` | Log level (`debug`, `info`, `warn`, `error`) | `info` |
 | `--version` | Print version and exit | |
 
 ## Skill Registry
 
-The relay includes a **skill registry** that enables capability-based agent discovery. Agents register their skills with the relay, and other agents can query by skill ID to find providers.
+The relay includes a **skill registry** that enables capability-based agent discovery.
 
 ### How It Works
 
@@ -87,40 +91,71 @@ The relay includes a **skill registry** that enables capability-based agent disc
 3. Other agents query `discover("translate")` to find providers
 4. Registry returns matching agents with their Peer IDs and metadata
 5. Agents send heartbeats to keep registrations alive (TTL-based)
+6. Peer disconnections automatically remove registrations
 
-### Registry gRPC API
+### Registry gRPC API (RegistryService)
 
 | RPC | Description |
 |---|---|
 | `RegisterSkills` | Register skills with the relay. Returns expiration timestamp. |
 | `UnregisterSkills` | Remove specific skill registrations. |
-| `DiscoverBySkill` | Find agents offering a specific skill. Supports tag-based filtering. |
+| `DiscoverBySkill` | Find agents offering a specific skill. Supports tag-based filtering and federated queries. |
 | `Heartbeat` | Renew TTL on existing registrations. |
 
 ### Registry Limits
 
 | Limit | Value |
 |---|---|
-| Max registrations | 4096 |
+| Max local registrations | 4096 |
+| Max federated registrations | 8192 |
 | Default discover limit | 100 |
 | Hard discover limit | 1000 |
 | Default TTL | 30 seconds |
 
-### Tag-Based Filtering
+## Multi-Relay Federation
 
-Skills can include tags for fine-grained matching:
+Multiple relays can synchronize their registries using gossip-based federation, enabling global agent discovery across relay clusters.
 
-```python
-# Agent registers with tags
-Skill(id="translate", description="...", tags={"lang": "en,fr,de"})
+### How It Works
 
-# Another agent discovers with tag filter
-agents = await node.discover("translate", tags={"lang": "fr"})
+1. Configure `--federation-peers` with peer relay addresses
+2. Each relay periodically pulls updates from peers (`SyncRegistrations`)
+3. New local registrations are optionally pushed to peers (`PushRegistrations`)
+4. Conflicts are resolved using Last-Writer-Wins (LWW) with version counters
+5. Local registrations always take priority over federated ones
+
+### Federation gRPC API (FederationService)
+
+| RPC | Description |
+|---|---|
+| `SyncRegistrations` | Pull registration updates since a given timestamp |
+| `PushRegistrations` | Push local registration updates to a peer relay |
+
+### Example: Two-Relay Federation
+
+```bash
+# Relay 1
+./relay --key ./relay1.key --federation-peers "relay2.example.com:50052"
+
+# Relay 2
+./relay --key ./relay2.key --federation-peers "relay1.example.com:50052"
 ```
 
-## Relay Resource Limits
+Agents registered on Relay 1 become discoverable via Relay 2, and vice versa.
 
-The relay enforces per-peer and global limits to prevent abuse:
+## MCP Server
+
+The relay exposes an MCP (Model Context Protocol) Streamable HTTP server, allowing AI assistants to query the registry.
+
+| Tool | Description |
+|---|---|
+| `discover_agents` | Find agents offering a specific skill |
+| `list_skills` | List all registered skills with agent counts |
+| `get_relay_info` | Get relay status (peer ID, connections, registrations) |
+
+Default endpoint: `http://localhost:8080`
+
+## Relay Resource Limits
 
 | Limit | Value | Description |
 |---|---|---|
@@ -138,7 +173,7 @@ The relay enforces per-peer and global limits to prevent abuse:
 | **Oracle Cloud Free Tier** | $0/forever | 4 ARM cores, 24 GB RAM -- more than enough |
 | DigitalOcean | $4/mo | Basic droplet |
 | Fly.io | $0 (free tier) | 3 shared VMs |
-| Any VPS with public IP | Varies | Ensure ports 4001 TCP+UDP are open |
+| Any VPS with public IP | Varies | Ensure ports 4001 TCP+UDP and 50052 TCP are open |
 
 **Important:** Always use `--key` with a persistent path so your relay's Peer ID survives restarts. If the Peer ID changes, all agents need to update their bootstrap configuration.
 
