@@ -8,8 +8,10 @@ import (
 
 	pb "github.com/agentanycast/agentanycast-proto/gen/go/agentanycast/v1"
 	"github.com/agentanycast/agentanycast-relay/internal/registry"
+	"github.com/agentanycast/agentanycast-relay/internal/telemetry"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"go.opentelemetry.io/otel/attribute"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -91,6 +93,11 @@ func (f *Federation) syncAll(ctx context.Context) {
 // syncPeer pulls registration updates from one peer relay.
 // Respects circuit breaker backoff per peer.
 func (f *Federation) syncPeer(ctx context.Context, addr string, client pb.FederationServiceClient) error {
+	tracer := telemetry.Tracer("agentanycast.federation")
+	ctx, span := tracer.Start(ctx, "federation.sync_peer")
+	span.SetAttributes(attribute.String("peer_addr", addr))
+	defer span.End()
+
 	start := time.Now()
 	defer func() {
 		metricSyncDuration.WithLabelValues(addr).Observe(time.Since(start).Seconds())
