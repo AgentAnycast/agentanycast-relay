@@ -222,3 +222,45 @@ func TestConcurrentAccess(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestStats(t *testing.T) {
+	reg := New(Config{TTL: 5 * time.Second, Logger: testLogger()})
+	defer reg.Close()
+
+	// Empty registry.
+	stats := reg.Stats()
+	if stats.LocalCount != 0 || stats.FederatedCount != 0 || stats.SkillCount != 0 {
+		t.Fatalf("expected empty stats, got %+v", stats)
+	}
+
+	// Register some agents.
+	_, _ = reg.Register("peer-1", []SkillInfo{
+		{SkillID: "summarize"},
+		{SkillID: "translate"},
+	}, "Agent A", "")
+	_, _ = reg.Register("peer-2", []SkillInfo{
+		{SkillID: "summarize"},
+	}, "Agent B", "")
+
+	stats = reg.Stats()
+	if stats.LocalCount != 2 {
+		t.Fatalf("expected 2 local, got %d", stats.LocalCount)
+	}
+	if stats.SkillCount != 2 {
+		t.Fatalf("expected 2 skills, got %d", stats.SkillCount)
+	}
+
+	// Add a federated registration.
+	now := time.Now()
+	_ = reg.RegisterFederated("peer-3", "relay-2", []SkillInfo{
+		{SkillID: "code"},
+	}, "Agent C", "", now, now.Add(5*time.Second), uint64(now.UnixNano()))
+
+	stats = reg.Stats()
+	if stats.FederatedCount != 1 {
+		t.Fatalf("expected 1 federated, got %d", stats.FederatedCount)
+	}
+	if stats.FedSkillCount != 1 {
+		t.Fatalf("expected 1 fed skill, got %d", stats.FedSkillCount)
+	}
+}

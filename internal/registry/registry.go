@@ -380,6 +380,43 @@ func (r *Registry) FederatedCount() int {
 	return int(r.federatedCount.Load())
 }
 
+// RegistryStats holds a snapshot of registry statistics.
+type RegistryStats struct {
+	LocalCount     int `json:"local_count"`
+	FederatedCount int `json:"federated_count"`
+	SkillCount     int `json:"skill_count"`
+	FedSkillCount  int `json:"fed_skill_count"`
+}
+
+// Stats returns a point-in-time snapshot of registry statistics.
+func (r *Registry) Stats() RegistryStats {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return RegistryStats{
+		LocalCount:     int(r.localCount.Load()),
+		FederatedCount: int(r.federatedCount.Load()),
+		SkillCount:     len(r.skillIndex),
+		FedSkillCount:  len(r.fedSkillIndex),
+	}
+}
+
+// GetRegistration returns the registration for a given peer ID, checking both
+// local and federated entries. Returns the registration and true if found and
+// not expired, or a zero value and false otherwise.
+func (r *Registry) GetRegistration(peerID string) (Registration, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	now := time.Now()
+	if reg, ok := r.entries[peerID]; ok && now.Before(reg.ExpiresAt) {
+		return *reg, true
+	}
+	if reg, ok := r.federated[peerID]; ok && now.Before(reg.ExpiresAt) {
+		return *reg, true
+	}
+	return Registration{}, false
+}
+
 // AllRegistrations returns all non-expired registrations.
 func (r *Registry) AllRegistrations() []Registration {
 	r.mu.RLock()

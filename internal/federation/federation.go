@@ -149,3 +149,46 @@ func (f *Federation) PeerCount() int {
 	defer f.mu.RUnlock()
 	return len(f.clients)
 }
+
+// PeerHealth describes the health of a single federation peer.
+type PeerHealth struct {
+	Address             string `json:"address"`
+	Healthy             bool   `json:"healthy"`
+	ConsecutiveFailures int    `json:"consecutive_failures"`
+	BackoffUntil        string `json:"backoff_until,omitempty"`
+}
+
+// FederationHealth holds a snapshot of federation health status.
+type FederationHealth struct {
+	Peers        int          `json:"peers"`
+	HealthyPeers int          `json:"healthy_peers"`
+	PeerDetails  []PeerHealth `json:"peer_details,omitempty"`
+}
+
+// HealthStatus returns a snapshot of federation peer health.
+func (f *Federation) HealthStatus() FederationHealth {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	now := time.Now()
+	h := FederationHealth{
+		Peers: len(f.clients),
+	}
+
+	for addr := range f.clients {
+		ph := PeerHealth{Address: addr, Healthy: true}
+		if state, ok := f.peerStates[addr]; ok {
+			ph.ConsecutiveFailures = state.consecutiveFailures
+			if now.Before(state.backoffUntil) {
+				ph.Healthy = false
+				ph.BackoffUntil = state.backoffUntil.Format(time.RFC3339)
+			}
+		}
+		if ph.Healthy {
+			h.HealthyPeers++
+		}
+		h.PeerDetails = append(h.PeerDetails, ph)
+	}
+
+	return h
+}

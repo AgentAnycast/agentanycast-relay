@@ -32,10 +32,15 @@ import (
 	"github.com/multiformats/go-multiaddr"
 	"google.golang.org/grpc"
 
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+
 	pb "github.com/agentanycast/agentanycast-proto/gen/go/agentanycast/v1"
+	"github.com/agentanycast/agentanycast-relay/internal/api"
 	"github.com/agentanycast/agentanycast-relay/internal/federation"
+	"github.com/agentanycast/agentanycast-relay/internal/health"
 	relaymcp "github.com/agentanycast/agentanycast-relay/internal/mcp"
 	"github.com/agentanycast/agentanycast-relay/internal/registry"
+	"github.com/agentanycast/agentanycast-relay/internal/telemetry"
 )
 
 var version = "dev"
@@ -50,6 +55,9 @@ func main() {
 		flagRegistryTTL     = flag.Duration("registry-ttl", 30*time.Second, "skill registration TTL")
 		flagEnableWebTransport = flag.Bool("enable-webtransport", false, "enable WebTransport (QUIC-based, browser-compatible)")
 		flagMCPListen              = flag.String("mcp-listen", ":8080", "MCP Streamable HTTP listen address (empty to disable)")
+		flagMetricsListen          = flag.String("metrics-listen", ":9090", "health/metrics HTTP listen address (empty to disable)")
+		flagAPIListen              = flag.String("api-listen", ":8081", "REST API listen address for agent directory (empty to disable)")
+		flagOTLPEndpoint           = flag.String("otlp-endpoint", "", "OTLP gRPC endpoint for tracing (e.g., localhost:4317)")
 		flagFederationPeers        = flag.String("federation-peers", "", "comma-separated peer relay gRPC addresses for federation")
 		flagFederationSyncInterval = flag.Duration("federation-sync-interval", 10*time.Second, "federation sync interval")
 		flagVersion                = flag.Bool("version", false, "print version and exit")
@@ -73,6 +81,20 @@ func main() {
 	}
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel}))
 	slog.SetDefault(logger)
+
+	// ── OpenTelemetry Tracing ────────────────────────────────
+	otelShutdown, err := telemetry.Setup(context.Background(), telemetry.Config{
+		Enabled:      *flagOTLPEndpoint != "",
+		OTLPEndpoint: *flagOTLPEndpoint,
+		SampleRate:   1.0,
+		Version:      version,
+		Logger:       logger,
+	})
+	if err != nil {
+		logger.Error("failed to initialize telemetry", "error", err)
+		os.Exit(1)
+	}
+	defer otelShutdown(context.Background())
 
 	// ── Identity ─────────────────────────────────────────────
 	privKey, err := loadOrGenerateKey(*flagKeyPath)
@@ -186,7 +208,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	grpcServer := grpc.NewServer()
+	grpcServer := grpc.NewServer(
+		grpc.StatsHandler(otelgrpc.NewServerHandler()),
+	)
 	pb.RegisterRegistryServiceServer(grpcServer, registry.NewGRPCServer(reg, logger))
 
 	// ── Federation ──────────────────────────────────────────
@@ -252,6 +276,39 @@ func main() {
 		}
 	}
 
+	// ── Health / Metrics Server ─────────────────────────────
+	var healthSrv *health.Server
+	if *flagMetricsListen != "" {
+		healthSrv = health.New(health.Config{
+			ListenAddr: *flagMetricsListen,
+			Version:    version,
+			Host:       h,
+			Registry:   reg,
+			Federation: fed,
+			Logger:     logger,
+		})
+		if err := healthSrv.Start(); err != nil {
+			logger.Error("failed to start health/metrics server", "error", err)
+			os.Exit(1)
+		}
+		logger.Info("health/metrics server started", "addr", *flagMetricsListen)
+	}
+
+	// ── REST API Server (Agent Directory) ───────────────────
+	var apiSrv *api.Server
+	if *flagAPIListen != "" {
+		apiSrv = api.New(api.Config{
+			ListenAddr: *flagAPIListen,
+			Registry:   reg,
+			Federation: fed,
+			Logger:     logger,
+		})
+		if err := apiSrv.Start(); err != nil {
+			logger.Error("failed to start API server", "error", err)
+			os.Exit(1)
+		}
+	}
+
 	// ── Print Startup Info ───────────────────────────────────
 	logger.Info("agentanycast-relay started",
 		"version", version,
@@ -261,6 +318,8 @@ func main() {
 		"registry_listen", *flagRegistryListen,
 		"registry_ttl", flagRegistryTTL.String(),
 		"mcp_listen", *flagMCPListen,
+		"metrics_listen", *flagMetricsListen,
+		"api_listen", *flagAPIListen,
 	)
 
 	for _, addr := range h.Addrs() {
@@ -270,6 +329,12 @@ func main() {
 	if *flagMCPListen != "" {
 		fmt.Printf("MCP_ADDR=%s\n", *flagMCPListen)
 	}
+	if *flagMetricsListen != "" {
+		fmt.Printf("METRICS_ADDR=%s\n", *flagMetricsListen)
+	}
+	if *flagAPIListen != "" {
+		fmt.Printf("API_ADDR=%s\n", *flagAPIListen)
+	}
 
 	// ── Wait for Shutdown ────────────────────────────────────
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -277,6 +342,12 @@ func main() {
 	<-ctx.Done()
 
 	logger.Info("shutting down")
+	if apiSrv != nil {
+		apiSrv.Close()
+	}
+	if healthSrv != nil {
+		healthSrv.Close()
+	}
 	if fed != nil {
 		fed.Stop()
 	}
