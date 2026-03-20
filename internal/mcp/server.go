@@ -51,7 +51,7 @@ func New(cfg Config) (*Server, error) {
 
 	mcpSrv := server.NewMCPServer(
 		"AgentAnycast Relay",
-		"0.3.0",
+		"0.6.0",
 		server.WithToolCapabilities(true),
 	)
 
