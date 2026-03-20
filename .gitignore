@@ -22,3 +22,8 @@ coverage.out
 *.key
 *.pem
 .mcpregistry_*
+
+# Web frontend
+web/node_modules/
+web/dist/
+internal/api/web/
