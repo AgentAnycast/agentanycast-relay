@@ -1,0 +1,40 @@
+# Local monitoring stack for AgentAnycast Relay.
+#
+# Usage:
+#   docker compose -f deploy/docker-compose.monitoring.yml up
+#
+# Access:
+#   Prometheus: http://localhost:9091
+#   Grafana:    http://localhost:3000 (admin/admin)
+#
+# Prerequisites:
+#   The relay must be running with --metrics-listen :9090 (default).
+
+services:
+  prometheus:
+    image: prom/prometheus:v3.2.1
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./grafana/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=7d"
+
+  grafana:
+    image: grafana/grafana:11.5.2
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/relay-overview.json:/etc/grafana/provisioning/dashboards/json/relay-overview.json:ro
+      - grafana-data:/var/lib/grafana
+
+volumes:
+  grafana-data:

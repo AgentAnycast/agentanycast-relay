@@ -1,0 +1,18 @@
+# Example Prometheus scrape configuration for AgentAnycast Relay.
+#
+# Usage:
+#   prometheus --config.file=prometheus.yml
+#
+# Or use deploy/docker-compose.monitoring.yml for a turnkey local stack.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: "agentanycast-relay"
+    static_configs:
+      # Use host.docker.internal when running Prometheus in Docker,
+      # or localhost when running Prometheus directly on the host.
+      - targets: ["host.docker.internal:9090"]
+    metrics_path: /metrics
