@@ -2,13 +2,49 @@ package federation
 
 import (
 	"context"
+	"math"
 	"sync"
 	"time"
 
 	pb "github.com/agentanycast/agentanycast-proto/gen/go/agentanycast/v1"
 	"github.com/agentanycast/agentanycast-relay/internal/registry"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
+
+// Prometheus metrics for federation operations.
+var (
+	metricSyncDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "federation_sync_duration_seconds",
+		Help:    "Duration of federation sync per peer.",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"peer"})
+	metricSyncErrorsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "federation_sync_errors_total",
+		Help: "Total number of federation sync errors.",
+	})
+	metricPushDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "federation_push_duration_seconds",
+		Help:    "Duration of federation push operations.",
+		Buckets: prometheus.DefBuckets,
+	})
+)
+
+// Circuit breaker constants.
+const (
+	circuitBreakerBaseDelay = 5 * time.Second
+	circuitBreakerMaxDelay  = 5 * time.Minute
+)
+
+// maxPushConcurrency is the maximum number of concurrent push goroutines.
+const maxPushConcurrency = 32
+
+// peerState tracks per-peer failure state for circuit breaking.
+type peerState struct {
+	consecutiveFailures int
+	backoffUntil        time.Time
+}
 
 // syncLoop runs periodically, pulling updates from all peer relays.
 func (f *Federation) syncLoop(ctx context.Context) {
@@ -27,20 +63,52 @@ func (f *Federation) syncLoop(ctx context.Context) {
 	}
 }
 
-// syncAll pulls updates from all configured peer relays.
+// syncAll pulls updates from all configured peer relays in parallel.
 func (f *Federation) syncAll(ctx context.Context) {
-	for addr, client := range f.clients {
-		if err := f.syncPeer(ctx, addr, client); err != nil {
-			f.logger.Warn("federation sync failed",
-				"peer_addr", addr,
-				"error", err,
-			)
-		}
+	f.mu.RLock()
+	clients := make(map[string]pb.FederationServiceClient, len(f.clients))
+	for k, v := range f.clients {
+		clients[k] = v
 	}
+	f.mu.RUnlock()
+
+	var wg sync.WaitGroup
+	for addr, client := range clients {
+		wg.Add(1)
+		go func(addr string, client pb.FederationServiceClient) {
+			defer wg.Done()
+			if err := f.syncPeer(ctx, addr, client); err != nil {
+				f.logger.Warn("federation sync failed",
+					"peer_addr", addr,
+					"error", err,
+				)
+			}
+		}(addr, client)
+	}
+	wg.Wait()
 }
 
 // syncPeer pulls registration updates from one peer relay.
+// Respects circuit breaker backoff per peer.
 func (f *Federation) syncPeer(ctx context.Context, addr string, client pb.FederationServiceClient) error {
+	start := time.Now()
+	defer func() {
+		metricSyncDuration.WithLabelValues(addr).Observe(time.Since(start).Seconds())
+	}()
+
+	// Circuit breaker: check if this peer is in backoff.
+	f.mu.RLock()
+	state := f.peerStates[addr]
+	f.mu.RUnlock()
+
+	if time.Now().Before(state.backoffUntil) {
+		f.logger.Debug("skipping peer sync (circuit breaker backoff)",
+			"peer_addr", addr,
+			"backoff_until", state.backoffUntil,
+		)
+		return nil
+	}
+
 	f.mu.RLock()
 	since := f.lastSync[addr]
 	f.mu.RUnlock()
@@ -56,8 +124,13 @@ func (f *Federation) syncPeer(ctx context.Context, addr string, client pb.Federa
 		Limit:   1000,
 	})
 	if err != nil {
+		metricSyncErrorsTotal.Inc()
+		f.recordPeerFailure(addr)
 		return err
 	}
+
+	// Success: reset circuit breaker.
+	f.recordPeerSuccess(addr)
 
 	accepted := 0
 	for _, fedReg := range resp.Registrations {
@@ -113,11 +186,49 @@ func (f *Federation) syncPeer(ctx context.Context, addr string, client pb.Federa
 	return nil
 }
 
+// recordPeerFailure increments the circuit breaker failure counter and sets backoff.
+func (f *Federation) recordPeerFailure(addr string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	state := f.peerStates[addr]
+	state.consecutiveFailures++
+	delay := circuitBreakerBaseDelay * time.Duration(math.Pow(2, float64(state.consecutiveFailures-1)))
+	if delay > circuitBreakerMaxDelay {
+		delay = circuitBreakerMaxDelay
+	}
+	state.backoffUntil = time.Now().Add(delay)
+	f.peerStates[addr] = state
+}
+
+// recordPeerSuccess resets the circuit breaker state for a peer.
+func (f *Federation) recordPeerSuccess(addr string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if _, exists := f.peerStates[addr]; exists {
+		f.peerStates[addr] = peerState{}
+	}
+}
+
 // PushLocal pushes local registration changes to all peer relays.
+// Uses bounded concurrency to limit simultaneous outbound pushes.
 func (f *Federation) PushLocal(regs []registry.Registration) error {
-	if len(f.clients) == 0 || len(regs) == 0 {
+	f.mu.RLock()
+	clients := make(map[string]pb.FederationServiceClient, len(f.clients))
+	for k, v := range f.clients {
+		clients[k] = v
+	}
+	f.mu.RUnlock()
+
+	if len(clients) == 0 || len(regs) == 0 {
 		return nil
 	}
+
+	start := time.Now()
+	defer func() {
+		metricPushDuration.Observe(time.Since(start).Seconds())
+	}()
 
 	fedRegs := make([]*pb.FederatedRegistration, 0, len(regs))
 	for _, reg := range regs {
@@ -142,10 +253,14 @@ func (f *Federation) PushLocal(regs []registry.Registration) error {
 		firstErr error
 		wg       sync.WaitGroup
 	)
-	for addr, client := range f.clients {
+	sem := make(chan struct{}, maxPushConcurrency) // bounded concurrency
+	for addr, client := range clients {
 		wg.Add(1)
 		go func(addr string, client pb.FederationServiceClient) {
 			defer wg.Done()
+			sem <- struct{}{}        // acquire
+			defer func() { <-sem }() // release
+
 			resp, err := client.PushRegistrations(ctx, &pb.PushRegistrationsRequest{
 				RelayId:       f.cfg.RelayID,
 				Registrations: fedRegs,

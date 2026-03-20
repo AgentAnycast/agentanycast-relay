@@ -9,7 +9,11 @@ import (
 	"errors"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
 // DefaultTTL is the default registration time-to-live.
@@ -29,6 +33,30 @@ const MaxDiscoverLimit = 1000
 
 // ErrRegistryFull is returned when the registry has reached its maximum capacity.
 var ErrRegistryFull = errors.New("registry has reached maximum capacity")
+
+// ErrFederatedRegistryFull is returned when the federated registry has reached its maximum capacity.
+var ErrFederatedRegistryFull = errors.New("federated registry has reached maximum capacity")
+
+// Prometheus metrics for registry operations.
+var (
+	metricLocalCount = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "registry_local_count",
+		Help: "Number of active local registrations.",
+	})
+	metricFederatedCount = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "registry_federated_count",
+		Help: "Number of active federated registrations.",
+	})
+	metricDiscoverDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "registry_discover_duration_seconds",
+		Help:    "Duration of discovery queries.",
+		Buckets: prometheus.DefBuckets,
+	})
+	metricEvictionsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "registry_evictions_total",
+		Help: "Total number of expired registrations evicted.",
+	})
+)
 
 // SkillInfo describes a single skill for registry purposes.
 type SkillInfo struct {
@@ -51,11 +79,11 @@ type Registration struct {
 
 // Config holds registry configuration.
 type Config struct {
-	TTL                      time.Duration
-	MaxRegistrations         int
+	TTL                       time.Duration
+	MaxRegistrations          int
 	MaxFederatedRegistrations int
-	CleanupInterval          time.Duration
-	Logger                   *slog.Logger
+	CleanupInterval           time.Duration
+	Logger                    *slog.Logger
 }
 
 // Registry is a thread-safe, in-memory skill registry.
@@ -63,6 +91,15 @@ type Registry struct {
 	mu        sync.RWMutex
 	entries   map[string]*Registration // keyed by peer_id (local registrations)
 	federated map[string]*Registration // keyed by peer_id (federated registrations)
+
+	// Inverted indexes: skillID -> set of peerIDs for O(1) discovery.
+	skillIndex    map[string]map[string]struct{} // local registrations
+	fedSkillIndex map[string]map[string]struct{} // federated registrations
+
+	// Atomic counters for O(1) Count().
+	localCount     atomic.Int64
+	federatedCount atomic.Int64
+
 	config    Config
 	logger    *slog.Logger
 	stopCh    chan struct{}
@@ -88,15 +125,61 @@ func New(cfg Config) *Registry {
 	}
 
 	r := &Registry{
-		entries:   make(map[string]*Registration),
-		federated: make(map[string]*Registration),
-		config:    cfg,
-		logger:    cfg.Logger,
-		stopCh:    make(chan struct{}),
+		entries:       make(map[string]*Registration),
+		federated:     make(map[string]*Registration),
+		skillIndex:    make(map[string]map[string]struct{}),
+		fedSkillIndex: make(map[string]map[string]struct{}),
+		config:        cfg,
+		logger:        cfg.Logger,
+		stopCh:        make(chan struct{}),
 	}
 
 	go r.cleanupLoop()
 	return r
+}
+
+// copySkills deep-copies a slice of SkillInfo to avoid referencing caller's maps.
+func copySkills(skills []SkillInfo) []SkillInfo {
+	copied := make([]SkillInfo, len(skills))
+	for i, s := range skills {
+		var tags map[string]string
+		if len(s.Tags) > 0 {
+			tags = make(map[string]string, len(s.Tags))
+			for k, v := range s.Tags {
+				tags[k] = v
+			}
+		}
+		copied[i] = SkillInfo{
+			SkillID:     s.SkillID,
+			Description: s.Description,
+			Tags:        tags,
+		}
+	}
+	return copied
+}
+
+// addToSkillIndex adds all skills for a peer to the given inverted index.
+func addToSkillIndex(index map[string]map[string]struct{}, peerID string, skills []SkillInfo) {
+	for _, s := range skills {
+		peers, ok := index[s.SkillID]
+		if !ok {
+			peers = make(map[string]struct{})
+			index[s.SkillID] = peers
+		}
+		peers[peerID] = struct{}{}
+	}
+}
+
+// removeFromSkillIndex removes all skills for a peer from the given inverted index.
+func removeFromSkillIndex(index map[string]map[string]struct{}, peerID string, skills []SkillInfo) {
+	for _, s := range skills {
+		if peers, ok := index[s.SkillID]; ok {
+			delete(peers, peerID)
+			if len(peers) == 0 {
+				delete(index, s.SkillID)
+			}
+		}
+	}
 }
 
 // Register adds or refreshes an agent's skill registration.
@@ -106,7 +189,8 @@ func (r *Registry) Register(peerID string, skills []SkillInfo, agentName, agentD
 	defer r.mu.Unlock()
 
 	// Enforce capacity limit (allow updates to existing registrations).
-	if _, exists := r.entries[peerID]; !exists {
+	existing, exists := r.entries[peerID]
+	if !exists {
 		if len(r.entries) >= r.config.MaxRegistrations {
 			return time.Time{}, ErrRegistryFull
 		}
@@ -114,23 +198,13 @@ func (r *Registry) Register(peerID string, skills []SkillInfo, agentName, agentD
 
 	now := time.Now()
 	expiresAt := now.Add(r.config.TTL)
+	copiedSkills := copySkills(skills)
 
-	// Deep-copy tags to avoid referencing caller's maps.
-	copiedSkills := make([]SkillInfo, len(skills))
-	for i, s := range skills {
-		var tags map[string]string
-		if len(s.Tags) > 0 {
-			tags = make(map[string]string, len(s.Tags))
-			for k, v := range s.Tags {
-				tags[k] = v
-			}
-		}
-		copiedSkills[i] = SkillInfo{
-			SkillID:     s.SkillID,
-			Description: s.Description,
-			Tags:        tags,
-		}
+	// Update inverted index: remove old skills, add new ones.
+	if exists {
+		removeFromSkillIndex(r.skillIndex, peerID, existing.Skills)
 	}
+	addToSkillIndex(r.skillIndex, peerID, copiedSkills)
 
 	r.entries[peerID] = &Registration{
 		PeerID:           peerID,
@@ -140,6 +214,11 @@ func (r *Registry) Register(peerID string, skills []SkillInfo, agentName, agentD
 		RegisteredAt:     now,
 		ExpiresAt:        expiresAt,
 		Version:          uint64(now.UnixNano()),
+	}
+
+	if !exists {
+		r.localCount.Add(1)
+		metricLocalCount.Set(float64(r.localCount.Load()))
 	}
 
 	return expiresAt, nil
@@ -152,7 +231,12 @@ func (r *Registry) Unregister(peerID string, skillIDs []string) {
 	defer r.mu.Unlock()
 
 	if len(skillIDs) == 0 {
-		delete(r.entries, peerID)
+		if reg, ok := r.entries[peerID]; ok {
+			removeFromSkillIndex(r.skillIndex, peerID, reg.Skills)
+			delete(r.entries, peerID)
+			r.localCount.Add(-1)
+			metricLocalCount.Set(float64(r.localCount.Load()))
+		}
 		r.logger.Info("peer unregistered", "peer_id", peerID)
 		return
 	}
@@ -167,6 +251,18 @@ func (r *Registry) Unregister(peerID string, skillIDs []string) {
 		remove[id] = struct{}{}
 	}
 
+	// Remove from inverted index for the specific skills being unregistered.
+	for _, s := range reg.Skills {
+		if _, found := remove[s.SkillID]; found {
+			if peers, ok := r.skillIndex[s.SkillID]; ok {
+				delete(peers, peerID)
+				if len(peers) == 0 {
+					delete(r.skillIndex, s.SkillID)
+				}
+			}
+		}
+	}
+
 	filtered := make([]SkillInfo, 0, len(reg.Skills))
 	for _, s := range reg.Skills {
 		if _, found := remove[s.SkillID]; !found {
@@ -176,6 +272,8 @@ func (r *Registry) Unregister(peerID string, skillIDs []string) {
 
 	if len(filtered) == 0 {
 		delete(r.entries, peerID)
+		r.localCount.Add(-1)
+		metricLocalCount.Set(float64(r.localCount.Load()))
 	} else {
 		reg.Skills = filtered
 	}
@@ -191,40 +289,51 @@ func (r *Registry) DiscoverBySkill(skillID string, tags map[string]string, limit
 		limit = MaxDiscoverLimit
 	}
 
+	start := time.Now()
+	defer func() {
+		metricDiscoverDuration.Observe(time.Since(start).Seconds())
+	}()
+
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
 	now := time.Now()
 	var results []Registration
 
-	// Always search local entries first.
+	// Use inverted index for O(1) lookup of peers offering this skill.
 	localPeers := make(map[string]struct{})
-	for _, reg := range r.entries {
-		if now.After(reg.ExpiresAt) {
-			continue
-		}
-		if hasSkill(reg, skillID, tags) {
-			results = append(results, *reg)
-			localPeers[reg.PeerID] = struct{}{}
-			if len(results) >= limit {
-				return results
+	if peerIDs, ok := r.skillIndex[skillID]; ok {
+		for peerID := range peerIDs {
+			reg := r.entries[peerID]
+			if reg == nil || now.After(reg.ExpiresAt) {
+				continue
+			}
+			if hasSkill(reg, skillID, tags) {
+				results = append(results, *reg)
+				localPeers[reg.PeerID] = struct{}{}
+				if len(results) >= limit {
+					return results
+				}
 			}
 		}
 	}
 
 	// Optionally include federated entries, skipping peers already found locally.
 	if includeFederated {
-		for _, reg := range r.federated {
-			if now.After(reg.ExpiresAt) {
-				continue
-			}
-			if _, isLocal := localPeers[reg.PeerID]; isLocal {
-				continue // local registration takes priority
-			}
-			if hasSkill(reg, skillID, tags) {
-				results = append(results, *reg)
-				if len(results) >= limit {
-					break
+		if fedPeerIDs, ok := r.fedSkillIndex[skillID]; ok {
+			for peerID := range fedPeerIDs {
+				if _, isLocal := localPeers[peerID]; isLocal {
+					continue // local registration takes priority
+				}
+				reg := r.federated[peerID]
+				if reg == nil || now.After(reg.ExpiresAt) {
+					continue
+				}
+				if hasSkill(reg, skillID, tags) {
+					results = append(results, *reg)
+					if len(results) >= limit {
+						break
+					}
 				}
 			}
 		}
@@ -252,25 +361,23 @@ func (r *Registry) Heartbeat(peerID string) time.Time {
 func (r *Registry) RemovePeer(peerID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if _, ok := r.entries[peerID]; ok {
+	if reg, ok := r.entries[peerID]; ok {
+		removeFromSkillIndex(r.skillIndex, peerID, reg.Skills)
 		delete(r.entries, peerID)
+		r.localCount.Add(-1)
+		metricLocalCount.Set(float64(r.localCount.Load()))
 		r.logger.Info("peer removed from registry (disconnect)", "peer_id", peerID)
 	}
 }
 
-// Count returns the number of active (non-expired) registrations.
+// Count returns the number of active local registrations.
 func (r *Registry) Count() int {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	return int(r.localCount.Load())
+}
 
-	now := time.Now()
-	count := 0
-	for _, reg := range r.entries {
-		if now.Before(reg.ExpiresAt) {
-			count++
-		}
-	}
-	return count
+// FederatedCount returns the number of active federated registrations.
+func (r *Registry) FederatedCount() int {
+	return int(r.federatedCount.Load())
 }
 
 // AllRegistrations returns all non-expired registrations.
@@ -317,18 +424,27 @@ func (r *Registry) evictExpired() {
 	evicted := 0
 	for peerID, reg := range r.entries {
 		if now.After(reg.ExpiresAt) {
+			removeFromSkillIndex(r.skillIndex, peerID, reg.Skills)
 			delete(r.entries, peerID)
+			r.localCount.Add(-1)
 			evicted++
 		}
 	}
 	fedEvicted := 0
 	for peerID, reg := range r.federated {
 		if now.After(reg.ExpiresAt) {
+			removeFromSkillIndex(r.fedSkillIndex, peerID, reg.Skills)
 			delete(r.federated, peerID)
+			r.federatedCount.Add(-1)
 			fedEvicted++
 		}
 	}
-	if evicted > 0 || fedEvicted > 0 {
+
+	totalEvicted := evicted + fedEvicted
+	if totalEvicted > 0 {
+		metricEvictionsTotal.Add(float64(totalEvicted))
+		metricLocalCount.Set(float64(r.localCount.Load()))
+		metricFederatedCount.Set(float64(r.federatedCount.Load()))
 		r.logger.Debug("evicted expired registrations",
 			"local", evicted,
 			"federated", fedEvicted,
@@ -337,9 +453,6 @@ func (r *Registry) evictExpired() {
 		)
 	}
 }
-
-// ErrFederatedRegistryFull is returned when the federated registry has reached its maximum capacity.
-var ErrFederatedRegistryFull = errors.New("federated registry has reached maximum capacity")
 
 // RegisterFederated stores a federated registration from another relay.
 // Uses LWW (last-writer-wins): only accepts if version >= existing version.
@@ -364,22 +477,16 @@ func (r *Registry) RegisterFederated(peerID, originRelayID string, skills []Skil
 		}
 	}
 
-	// Deep-copy tags.
-	copiedSkills := make([]SkillInfo, len(skills))
-	for i, s := range skills {
-		var tags map[string]string
-		if len(s.Tags) > 0 {
-			tags = make(map[string]string, len(s.Tags))
-			for k, v := range s.Tags {
-				tags[k] = v
-			}
-		}
-		copiedSkills[i] = SkillInfo{
-			SkillID:     s.SkillID,
-			Description: s.Description,
-			Tags:        tags,
-		}
+	copiedSkills := copySkills(skills)
+
+	// Update federated inverted index.
+	if existing, ok := r.federated[peerID]; ok {
+		removeFromSkillIndex(r.fedSkillIndex, peerID, existing.Skills)
+	} else {
+		r.federatedCount.Add(1)
+		metricFederatedCount.Set(float64(r.federatedCount.Load()))
 	}
+	addToSkillIndex(r.fedSkillIndex, peerID, copiedSkills)
 
 	r.federated[peerID] = &Registration{
 		PeerID:           peerID,

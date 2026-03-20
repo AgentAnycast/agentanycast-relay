@@ -37,17 +37,18 @@ type Config struct {
 
 // Federation manages relay-to-relay skill registry synchronization.
 type Federation struct {
-	cfg       Config
-	registry  *registry.Registry
-	clients   map[string]pb.FederationServiceClient
-	conns     map[string]*grpc.ClientConn
-	lastSync  map[string]time.Time // per-peer sync timestamps
-	mu        sync.RWMutex
-	cancel    context.CancelFunc
-	wg        sync.WaitGroup
-	logger    *slog.Logger
-	startOnce sync.Once
-	started   bool
+	cfg        Config
+	registry   *registry.Registry
+	clients    map[string]pb.FederationServiceClient
+	conns      map[string]*grpc.ClientConn
+	lastSync   map[string]time.Time // per-peer sync timestamps
+	peerStates map[string]peerState // per-peer circuit breaker state
+	mu         sync.RWMutex
+	cancel     context.CancelFunc
+	wg         sync.WaitGroup
+	logger     *slog.Logger
+	startOnce  sync.Once
+	started    bool
 }
 
 // New creates a new Federation manager.
@@ -60,12 +61,13 @@ func New(cfg Config, reg *registry.Registry) *Federation {
 	}
 
 	return &Federation{
-		cfg:      cfg,
-		registry: reg,
-		clients:  make(map[string]pb.FederationServiceClient),
-		conns:    make(map[string]*grpc.ClientConn),
-		lastSync: make(map[string]time.Time),
-		logger:   cfg.Logger,
+		cfg:        cfg,
+		registry:   reg,
+		clients:    make(map[string]pb.FederationServiceClient),
+		conns:      make(map[string]*grpc.ClientConn),
+		lastSync:   make(map[string]time.Time),
+		peerStates: make(map[string]peerState),
+		logger:     cfg.Logger,
 	}
 }
 
