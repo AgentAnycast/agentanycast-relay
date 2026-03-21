@@ -2,7 +2,7 @@
 
 Self-hosted circuit relay server, skill registry, and federation hub for cross-network agent communication.
 
-[![Go](https://img.shields.io/badge/Go-1.24+-00ADD8?logo=go&logoColor=white)](https://go.dev)
+[![Go](https://img.shields.io/badge/Go-1.25+-00ADD8?logo=go&logoColor=white)](https://go.dev)
 [![License](https://img.shields.io/badge/License-FSL--1.1--ALv2-blue)](LICENSE)
 
 > **Deploy your own relay in one command.** AgentAnycast is fully decentralized -- you own your infrastructure.
