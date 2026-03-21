@@ -1,0 +1,20 @@
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - unused
+    - gosimple
+    - ineffassign
+    - typecheck
+    - misspell
+    - gofmt
+    - goimports
+
+issues:
+  exclude-dirs:
+    - vendor
+    - internal/api/web
