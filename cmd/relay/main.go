@@ -57,6 +57,7 @@ func main() {
 		flagMCPListen              = flag.String("mcp-listen", ":8080", "MCP Streamable HTTP listen address (empty to disable)")
 		flagMetricsListen          = flag.String("metrics-listen", ":9090", "health/metrics HTTP listen address (empty to disable)")
 		flagAPIListen              = flag.String("api-listen", ":8081", "REST API listen address for agent directory (empty to disable)")
+		flagAPICORSOrigins         = flag.String("api-cors-origins", "", "comma-separated allowed CORS origins (empty = same-origin only, * = all)")
 		flagOTLPEndpoint           = flag.String("otlp-endpoint", "", "OTLP gRPC endpoint for tracing (e.g., localhost:4317)")
 		flagFederationPeers        = flag.String("federation-peers", "", "comma-separated peer relay gRPC addresses for federation")
 		flagFederationSyncInterval = flag.Duration("federation-sync-interval", 10*time.Second, "federation sync interval")
@@ -297,11 +298,16 @@ func main() {
 	// ── REST API Server (Agent Directory) ───────────────────
 	var apiSrv *api.Server
 	if *flagAPIListen != "" {
+		var corsOrigins []string
+		if *flagAPICORSOrigins != "" {
+			corsOrigins = strings.Split(*flagAPICORSOrigins, ",")
+		}
 		apiSrv = api.New(api.Config{
-			ListenAddr: *flagAPIListen,
-			Registry:   reg,
-			Federation: fed,
-			Logger:     logger,
+			ListenAddr:  *flagAPIListen,
+			CORSOrigins: corsOrigins,
+			Registry:    reg,
+			Federation:  fed,
+			Logger:      logger,
 		})
 		if err := apiSrv.Start(); err != nil {
 			logger.Error("failed to start API server", "error", err)

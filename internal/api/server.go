@@ -21,26 +21,34 @@ import (
 
 // Config holds API server configuration.
 type Config struct {
-	ListenAddr string
-	Registry   *registry.Registry
-	Federation *federation.Federation // optional
-	Logger     *slog.Logger
+	ListenAddr  string
+	CORSOrigins []string // Allowed CORS origins; empty defaults to same-origin only.
+	Registry    *registry.Registry
+	Federation  *federation.Federation // optional
+	Logger      *slog.Logger
 }
 
 // Server serves the REST API.
 type Server struct {
-	httpServer *http.Server
-	registry   *registry.Registry
-	federation *federation.Federation
-	logger     *slog.Logger
+	httpServer  *http.Server
+	registry    *registry.Registry
+	federation  *federation.Federation
+	logger      *slog.Logger
+	corsOrigins []string
 }
 
 // New creates a new API server.
 func New(cfg Config) *Server {
+	corsOrigins := cfg.CORSOrigins
+	if len(corsOrigins) == 0 {
+		corsOrigins = []string{} // no CORS headers → same-origin only
+	}
+
 	s := &Server{
-		registry:   cfg.Registry,
-		federation: cfg.Federation,
-		logger:     cfg.Logger,
+		registry:    cfg.Registry,
+		federation:  cfg.Federation,
+		logger:      cfg.Logger,
+		corsOrigins: corsOrigins,
 	}
 
 	mux := http.NewServeMux()
@@ -53,7 +61,7 @@ func New(cfg Config) *Server {
 	mux.Handle("/", WebHandler())
 
 	// Wrap with CORS middleware.
-	handler := corsMiddleware(mux)
+	handler := s.corsMiddleware(mux)
 
 	s.httpServer = &http.Server{
 		Addr:         cfg.ListenAddr,
@@ -84,11 +92,15 @@ func (s *Server) Close() error {
 	return s.httpServer.Shutdown(ctx)
 }
 
-func corsMiddleware(next http.Handler) http.Handler {
+func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		origin := r.Header.Get("Origin")
+		if origin != "" && s.isAllowedOrigin(origin) {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+			w.Header().Set("Vary", "Origin")
+		}
 
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -97,4 +109,13 @@ func corsMiddleware(next http.Handler) http.Handler {
 
 		next.ServeHTTP(w, r)
 	})
+}
+
+func (s *Server) isAllowedOrigin(origin string) bool {
+	for _, allowed := range s.corsOrigins {
+		if allowed == "*" || allowed == origin {
+			return true
+		}
+	}
+	return false
 }
