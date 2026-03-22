@@ -9,11 +9,14 @@ Self-hosted circuit relay server, skill registry, and federation hub for cross-n
 
 ## What is this?
 
-The relay server provides three services:
+The relay server provides these services:
 
 1. **Circuit Relay** — bridges agents across different networks when direct connections aren't possible
 2. **Skill Registry** — lets agents register their skills and discover each other by capability
 3. **Federation** — synchronizes registrations across multiple relays for global discovery
+4. **Agent Directory** — REST API and embedded web UI for browsing registered agents and skills
+5. **Health Monitoring** — `/health` JSON endpoint and `/metrics` Prometheus endpoint
+6. **OpenTelemetry** — distributed tracing with OTLP exporter
 
 ```
 Agent A (behind NAT)                              Agent B (behind NAT)
@@ -77,6 +80,9 @@ export AGENTANYCAST_BOOTSTRAP_PEERS="/ip4/<YOUR_IP>/tcp/4001/p2p/12D3KooW..."
 | `--mcp-listen` | MCP Streamable HTTP listen address | `:8080` |
 | `--federation-peers` | Comma-separated peer relay gRPC addresses | (none) |
 | `--federation-sync-interval` | Federation gossip sync interval | `10s` |
+| `--metrics-listen` | Health/metrics HTTP address | `:9090` |
+| `--api-listen` | Agent directory API address | `:8081` |
+| `--otlp-endpoint` | OTLP collector endpoint | (disabled) |
 | `--log-level` | Log level (`debug`, `info`, `warn`, `error`) | `info` |
 | `--version` | Print version and exit | |
 
@@ -155,6 +161,49 @@ The relay exposes an MCP (Model Context Protocol) Streamable HTTP server, allowi
 
 Default endpoint: `http://localhost:8080`
 
+## Health Monitoring
+
+The relay exposes health and metrics endpoints on a configurable HTTP port (default `:9090`):
+
+- `GET /health` — JSON health status with uptime, peer count, and registration stats
+- `GET /metrics` — Prometheus metrics endpoint
+
+```bash
+# Check relay health
+curl http://localhost:9090/health
+
+# Scrape Prometheus metrics
+curl http://localhost:9090/metrics
+```
+
+## Agent Directory
+
+A REST API and embedded web UI for browsing registered agents and skills. Default address: `:8081`.
+
+### REST API
+
+| Endpoint | Description |
+|---|---|
+| `GET /api/v1/agents` | List all registered agents with their skills and metadata |
+| `GET /api/v1/skills` | List all registered skills with agent counts |
+| `GET /api/v1/stats` | Relay statistics (connections, registrations, uptime) |
+
+### Web UI
+
+Open `http://localhost:8081` in a browser to access the embedded agent directory dashboard. The UI provides a searchable view of all registered agents and their capabilities.
+
+## OpenTelemetry
+
+Distributed tracing with OTLP exporter. Spans cover relay operations, registry lookups, and federation sync. Configure with:
+
+```bash
+./relay --otlp-endpoint localhost:4317
+```
+
+### Grafana Dashboard
+
+A pre-built Grafana dashboard is included in `deploy/grafana/`. Import it into your Grafana instance to visualize relay metrics including connection counts, registration churn, federation sync latency, and resource utilization.
+
 ## Relay Resource Limits
 
 | Limit | Value | Description |
@@ -173,7 +222,7 @@ Default endpoint: `http://localhost:8080`
 | **Oracle Cloud Free Tier** | $0/forever | 4 ARM cores, 24 GB RAM -- more than enough |
 | DigitalOcean | $4/mo | Basic droplet |
 | Fly.io | $0 (free tier) | 3 shared VMs |
-| Any VPS with public IP | Varies | Ensure ports 4001 TCP+UDP and 50052 TCP are open |
+| Any VPS with public IP | Varies | Ensure ports 4001, 50052, 8081, 9090 are open |
 
 **Important:** Always use `--key` with a persistent path so your relay's Peer ID survives restarts. If the Peer ID changes, all agents need to update their bootstrap configuration.
 
