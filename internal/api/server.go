@@ -16,25 +16,34 @@ import (
 	"time"
 
 	"github.com/agentanycast/agentanycast-relay/internal/federation"
+	"github.com/agentanycast/agentanycast-relay/internal/namespace"
+	"github.com/agentanycast/agentanycast-relay/internal/policy"
 	"github.com/agentanycast/agentanycast-relay/internal/registry"
+	"github.com/agentanycast/agentanycast-relay/internal/resilience"
 )
 
 // Config holds API server configuration.
 type Config struct {
-	ListenAddr  string
-	CORSOrigins []string // Allowed CORS origins; empty defaults to same-origin only.
-	Registry    *registry.Registry
-	Federation  *federation.Federation // optional
-	Logger      *slog.Logger
+	ListenAddr      string
+	CORSOrigins     []string // Allowed CORS origins; empty defaults to same-origin only.
+	Registry        *registry.Registry
+	Federation      *federation.Federation // optional
+	PolicyEngine    *policy.Engine         // optional
+	NamespaceMgr    *namespace.Manager     // optional
+	BreakerRegistry *resilience.BreakerRegistry // optional
+	Logger          *slog.Logger
 }
 
 // Server serves the REST API.
 type Server struct {
-	httpServer  *http.Server
-	registry    *registry.Registry
-	federation  *federation.Federation
-	logger      *slog.Logger
-	corsOrigins []string
+	httpServer      *http.Server
+	registry        *registry.Registry
+	federation      *federation.Federation
+	policyEngine    *policy.Engine
+	namespaceMgr    *namespace.Manager
+	breakerRegistry *resilience.BreakerRegistry
+	logger          *slog.Logger
+	corsOrigins     []string
 }
 
 // New creates a new API server.
@@ -45,10 +54,13 @@ func New(cfg Config) *Server {
 	}
 
 	s := &Server{
-		registry:    cfg.Registry,
-		federation:  cfg.Federation,
-		logger:      cfg.Logger,
-		corsOrigins: corsOrigins,
+		registry:        cfg.Registry,
+		federation:      cfg.Federation,
+		policyEngine:    cfg.PolicyEngine,
+		namespaceMgr:    cfg.NamespaceMgr,
+		breakerRegistry: cfg.BreakerRegistry,
+		logger:          cfg.Logger,
+		corsOrigins:     corsOrigins,
 	}
 
 	mux := http.NewServeMux()
@@ -56,6 +68,27 @@ func New(cfg Config) *Server {
 	mux.HandleFunc("GET /api/v1/agents/{peer_id}", s.handleGetAgent)
 	mux.HandleFunc("GET /api/v1/skills", s.handleListSkills)
 	mux.HandleFunc("GET /api/v1/stats", s.handleStats)
+
+	// Policy engine routes.
+	if s.policyEngine != nil {
+		mux.HandleFunc("POST /api/v1/policies", s.handleCreatePolicy)
+		mux.HandleFunc("GET /api/v1/policies", s.handleListPolicies)
+		mux.HandleFunc("PUT /api/v1/policies/{id}", s.handleUpdatePolicy)
+		mux.HandleFunc("DELETE /api/v1/policies/{id}", s.handleDeletePolicy)
+	}
+
+	// Namespace routes.
+	if s.namespaceMgr != nil {
+		mux.HandleFunc("POST /api/v1/namespaces", s.handleCreateNamespace)
+		mux.HandleFunc("GET /api/v1/namespaces", s.handleListNamespaces)
+		mux.HandleFunc("DELETE /api/v1/namespaces/{name}", s.handleDeleteNamespace)
+	}
+
+	// Circuit breaker routes.
+	if s.breakerRegistry != nil {
+		mux.HandleFunc("GET /api/v1/circuit-breakers", s.handleListBreakers)
+		mux.HandleFunc("POST /api/v1/circuit-breakers/{name}/reset", s.handleResetBreaker)
+	}
 
 	// Serve embedded SPA for all non-API paths.
 	mux.Handle("/", WebHandler())
@@ -97,7 +130,7 @@ func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 		origin := r.Header.Get("Origin")
 		if origin != "" && s.isAllowedOrigin(origin) {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
-			w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 			w.Header().Set("Vary", "Origin")
 		}

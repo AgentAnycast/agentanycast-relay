@@ -39,7 +39,10 @@ import (
 	"github.com/agentanycast/agentanycast-relay/internal/federation"
 	"github.com/agentanycast/agentanycast-relay/internal/health"
 	relaymcp "github.com/agentanycast/agentanycast-relay/internal/mcp"
+	"github.com/agentanycast/agentanycast-relay/internal/namespace"
+	"github.com/agentanycast/agentanycast-relay/internal/policy"
 	"github.com/agentanycast/agentanycast-relay/internal/registry"
+	"github.com/agentanycast/agentanycast-relay/internal/resilience"
 	"github.com/agentanycast/agentanycast-relay/internal/telemetry"
 )
 
@@ -295,6 +298,18 @@ func main() {
 		logger.Info("health/metrics server started", "addr", *flagMetricsListen)
 	}
 
+	// ── Mesh Control Plane ─────────────────────────────────
+	policyEngine := policy.NewEngine(logger)
+	namespaceMgr := namespace.NewManager(logger)
+	breakerRegistry := resilience.NewBreakerRegistry(resilience.BreakerConfig{
+		FailureThreshold: 5,
+		SuccessThreshold: 3,
+		Cooldown:         30 * time.Second,
+	})
+	logger.Info("mesh control plane initialized",
+		"components", []string{"policy-engine", "namespace-manager", "circuit-breaker-registry"},
+	)
+
 	// ── REST API Server (Agent Directory) ───────────────────
 	var apiSrv *api.Server
 	if *flagAPIListen != "" {
@@ -303,11 +318,14 @@ func main() {
 			corsOrigins = strings.Split(*flagAPICORSOrigins, ",")
 		}
 		apiSrv = api.New(api.Config{
-			ListenAddr:  *flagAPIListen,
-			CORSOrigins: corsOrigins,
-			Registry:    reg,
-			Federation:  fed,
-			Logger:      logger,
+			ListenAddr:      *flagAPIListen,
+			CORSOrigins:     corsOrigins,
+			Registry:        reg,
+			Federation:      fed,
+			PolicyEngine:    policyEngine,
+			NamespaceMgr:    namespaceMgr,
+			BreakerRegistry: breakerRegistry,
+			Logger:          logger,
 		})
 		if err := apiSrv.Start(); err != nil {
 			logger.Error("failed to start API server", "error", err)
