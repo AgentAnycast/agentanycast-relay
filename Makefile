@@ -2,7 +2,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 BINARY  := agentanycast-relay
 LDFLAGS := -ldflags "-X main.version=$(VERSION)"
 
-.PHONY: all build build-web clean test lint
+.PHONY: all build build-web clean test bench lint
 
 all: build
 
@@ -21,6 +21,10 @@ build: build-web
 ## test: Run all tests.
 test:
 	go test ./...
+
+## bench: Run all benchmarks.
+bench:
+	go test -bench=. -benchmem -count=3 ./...
 
 ## lint: Run golangci-lint.
 lint:

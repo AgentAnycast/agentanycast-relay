@@ -13,8 +13,12 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /relay ./cmd/relay
 # Runtime stage
 FROM alpine:3.20
 
-RUN apk add --no-cache ca-certificates
+RUN apk add --no-cache ca-certificates \
+    && addgroup -S agentanycast && adduser -S agentanycast -G agentanycast
+
 COPY --from=builder /relay /usr/local/bin/agentanycast-relay
+
+USER agentanycast
 
 EXPOSE 4001/tcp
 EXPOSE 4001/udp

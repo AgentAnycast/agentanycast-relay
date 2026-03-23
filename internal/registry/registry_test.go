@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"fmt"
 	"log/slog"
 	"os"
 	"sync"
@@ -221,6 +222,45 @@ func TestConcurrentAccess(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+// BenchmarkRegistryRegister measures the cost of registering a peer with skills.
+func BenchmarkRegistryRegister(b *testing.B) {
+	reg := New(Config{TTL: 5 * time.Minute, Logger: testLogger()})
+	defer reg.Close()
+
+	skills := []SkillInfo{
+		{SkillID: "summarize", Description: "Summarize text"},
+		{SkillID: "translate", Description: "Translate text"},
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		peerID := fmt.Sprintf("peer-%d", i)
+		if _, err := reg.Register(peerID, skills, "Agent", "Benchmark agent"); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkRegistryDiscover measures the cost of discovering peers by skill ID
+// with a pre-populated registry.
+func BenchmarkRegistryDiscover(b *testing.B) {
+	reg := New(Config{TTL: 5 * time.Minute, Logger: testLogger()})
+	defer reg.Close()
+
+	// Pre-populate registry with 100 peers, each offering the target skill.
+	for i := 0; i < 100; i++ {
+		peerID := fmt.Sprintf("peer-%d", i)
+		_, _ = reg.Register(peerID, []SkillInfo{
+			{SkillID: "summarize", Description: "Summarize text"},
+		}, fmt.Sprintf("Agent-%d", i), "")
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = reg.DiscoverBySkill("summarize", nil, 0, false)
+	}
 }
 
 func TestStats(t *testing.T) {
