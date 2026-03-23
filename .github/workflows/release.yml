@@ -51,7 +51,7 @@ jobs:
           VERSION=${GITHUB_REF_NAME}
           go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" \
             -o agentanycast-relay-${{ matrix.os }}-${{ matrix.arch }} ./cmd/relay
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: agentanycast-relay-${{ matrix.os }}-${{ matrix.arch }}
           path: agentanycast-relay-${{ matrix.os }}-${{ matrix.arch }}
