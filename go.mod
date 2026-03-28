@@ -5,7 +5,7 @@ go 1.25.0
 require (
 	github.com/agentanycast/agentanycast-proto v0.0.0-00010101000000-000000000000
 	github.com/libp2p/go-libp2p v0.47.0
-	github.com/mark3labs/mcp-go v0.45.0
+	github.com/mark3labs/mcp-go v0.46.0
 	github.com/multiformats/go-multiaddr v0.16.1
 	github.com/prometheus/client_golang v1.22.0
 	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.67.0
